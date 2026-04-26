@@ -371,10 +371,10 @@ def insert_claim(conn, claim: dict, remedy_id: str | None, condition_id: str | N
                  claim_type, claim_summary, extracted_span,
                  polarity, negation, certainty,
                  confidence_score,
-                 method_text, dosage_text, cultural_tag,
-                 extracted_by)
+                 method_text, dosage_text, culture_tag,
+                 extractor)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id
+            RETURNING claim_id
             """,
             (
                 remedy_id,
@@ -398,18 +398,31 @@ def insert_claim(conn, claim: dict, remedy_id: str | None, condition_id: str | N
         return str(row[0])
 
 
+_link_failures = 0
+
+
 def link_claim_sources(conn, claim_id: str, comment_id: str, relevance: float = 1.0) -> None:
     """Insert the claim_sources join record."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO claim_sources (claim_id, source_comment_id, support_weight)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (claim_id, source_comment_id) DO NOTHING
-            """,
-            (claim_id, source_comment_id, relevance),
+    global _link_failures
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO claim_sources (claim_id, source_comment_id, support_weight)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (claim_id, source_comment_id) DO NOTHING
+                """,
+                (claim_id, comment_id, relevance),
+            )
+            conn.commit()
+    except Exception as exc:
+        _link_failures += 1
+        log.error(
+            "link_claim_sources failed (claim_id=%s, comment_id=%s, failure #%d): %s",
+            claim_id, comment_id, _link_failures, exc,
         )
-        conn.commit()
+        conn.rollback()
+        raise
 
 
 # ---------------------------------------------------------------------------

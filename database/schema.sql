@@ -346,7 +346,7 @@ CREATE INDEX IF NOT EXISTS ix_claims_mod_status
     ON claims (mod_status);
 CREATE INDEX IF NOT EXISTS ix_claims_curated_at
     ON claims (curated_at DESC);
- (provenance — enforces every claim links to ≥1 source) ───
+-- ── claim_sources: provenance — every atomic claim links to ≥1 source ────────
 CREATE TABLE IF NOT EXISTS claim_sources (
     claim_source_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     claim_id             UUID NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,

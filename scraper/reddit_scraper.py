@@ -133,7 +133,7 @@ def upsert_comments(conn, post_uuid: str, comments: list[dict]) -> int:
             cur,
             """
             INSERT INTO source_comments
-                (post_id, platform, external_id, parent_id, body,
+                (post_id, platform, external_id, parent_comment_id, body,
                  author_hash, score, posted_at, raw_json)
             VALUES %s
             ON CONFLICT (platform, external_id) DO NOTHING

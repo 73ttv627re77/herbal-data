@@ -133,9 +133,9 @@ CLAIM_SUMMARY = {
         "body": "string",
         "subreddit": "string|null",
         "posted_at": "datetime",
-        "relevance_score": "float",
+        "support_weight": "float",
     }],
-    "extracted_by": "string",
+    "extractor": "string",
     "extracted_at": "datetime",
 }
 
@@ -193,10 +193,11 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+_wildcard_cors = config.CORS_ORIGINS == ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS if config.CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=not _wildcard_cors,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -369,7 +370,7 @@ async def get_remedy_claims(
             SELECT c.claim_id, c.claim_summary, c.claim_type, c.polarity,
                    c.negation, c.certainty, c.confidence_score,
                    c.method_text, c.dosage_text,
-                   c.cultural_tag, c.extracted_span, c.extracted_by, c.extracted_at,
+                   c.cultural_tag, c.extracted_span, c.extractor, c.extracted_at,
                    r.id as remedy_id, r.slug as remedy_slug, r.name as remedy_name,
                    r.category as remedy_category, r.evidence_level,
                    co.id as condition_id, co.slug as condition_slug,
@@ -399,7 +400,7 @@ async def get_remedy_claims(
                 "cultural_tag": row["cultural_tag"],
                 "claim_type": row["claim_type"],
                 "extracted_span": row["extracted_span"],
-                "extracted_by": row["extracted_by"],
+                "extractor": row["extractor"],
                 "extracted_at": row["extracted_at"],
                 "remedy": {
                     "id": str(row["remedy_id"]),
@@ -428,7 +429,7 @@ async def get_remedy_claims(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT cs.claim_id, cs.relevance_score,
+                    SELECT cs.claim_id, cs.support_weight,
                            sc.source_comment_id, sc.platform, sc.external_id,
                            sc.body, sc.author_hash, sc.score, sc.posted_at,
                            sp.subreddit
@@ -436,7 +437,7 @@ async def get_remedy_claims(
                     JOIN source_comments sc ON sc.source_comment_id = cs.source_comment_id
                     JOIN source_posts sp ON sp.id = sc.post_id
                     WHERE cs.claim_id = ANY(%s)
-                    ORDER BY cs.relevance_score DESC
+                    ORDER BY cs.support_weight DESC
                     """,
                     (claim_ids,),
                 )
@@ -453,7 +454,7 @@ async def get_remedy_claims(
                                 "score": src_row[7],
                                 "posted_at": src_row[8],
                                 "subreddit": src_row[9],
-                                "relevance_score": float(src_row[1]) if src_row[1] else 1.0,
+                                "support_weight": float(src_row[1]) if src_row[1] else 1.0,
                             })
                             break
 
@@ -482,13 +483,20 @@ async def get_remedy_evidence(
             remedy_id = str(row[0])
 
         base_sql = """
-            SELECT id, evidence_type, quality_score, title, authors,
-                   pubmed_id, doi, url, year, finding, summary, ingested_at
-            FROM evidence_items
-            WHERE remedy_id = %s
-            ORDER BY quality_score DESC, year DESC
+            SELECT ei.evidence_item_id, ei.evidence_type, ei.strength, ei.title, ei.authors,
+                   ei.pmid, ei.doi, ei.url, ei.year_published, ei.abstract_text, ei.notes,
+                   ei.created_at, rce.weight
+            FROM evidence_items ei
+            JOIN remedy_condition_evidence rce ON rce.evidence_item_id = ei.evidence_item_id
+            WHERE rce.remedy_id = %s
+            ORDER BY ei.strength DESC, ei.year_published DESC
         """
-        count_sql = "SELECT COUNT(*) FROM evidence_items WHERE remedy_id = %s"
+        count_sql = """
+            SELECT COUNT(*)
+            FROM evidence_items ei
+            JOIN remedy_condition_evidence rce ON rce.evidence_item_id = ei.evidence_item_id
+            WHERE rce.remedy_id = %s
+        """
 
         rows, total = paginate_query(conn, base_sql, [remedy_id], count_sql, limit, offset)
 
@@ -623,7 +631,7 @@ async def get_condition(slug: str):
             cur.execute(
                 """
                 SELECT DISTINCT r.id, r.slug, r.name, r.category, r.evidence_level,
-                       COUNT(c.id) as claim_count
+                       COUNT(c.claim_id) as claim_count
                 FROM claims c
                 JOIN remedies r ON r.id = c.remedy_id
                 WHERE c.condition_id = %s
@@ -694,7 +702,7 @@ async def list_claims(
             SELECT c.claim_id, c.claim_summary, c.claim_type, c.polarity,
                    c.negation, c.certainty, c.confidence_score,
                    c.method_text, c.dosage_text,
-                   c.cultural_tag, c.extracted_span, c.extracted_by, c.extracted_at,
+                   c.cultural_tag, c.extracted_span, c.extractor, c.extracted_at,
                    r.id as remedy_id, r.slug as remedy_slug, r.name as remedy_name,
                    r.evidence_level,
                    co.id as condition_id, co.slug as condition_slug,
@@ -724,7 +732,7 @@ async def list_claims(
                 "cultural_tag": row["cultural_tag"],
                 "claim_type": row["claim_type"],
                 "extracted_span": row["extracted_span"],
-                "extracted_by": row["extracted_by"],
+                "extractor": row["extractor"],
                 "extracted_at": row["extracted_at"],
                 "remedy": {
                     "id": str(row["remedy_id"]),
@@ -748,7 +756,7 @@ async def list_claims(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT cs.claim_id, cs.relevance_score,
+                    SELECT cs.claim_id, cs.support_weight,
                            sc.source_comment_id, sc.platform, sc.external_id, sc.body,
                            sc.author_hash, sc.score, sc.posted_at, sp.subreddit
                     FROM claim_sources cs
@@ -771,7 +779,7 @@ async def list_claims(
                                 "score": src_row[7],
                                 "posted_at": src_row[8],
                                 "subreddit": src_row[9],
-                                "relevance_score": float(src_row[1]) if src_row[1] else 1.0,
+                                "support_weight": float(src_row[1]) if src_row[1] else 1.0,
                             })
 
         return {

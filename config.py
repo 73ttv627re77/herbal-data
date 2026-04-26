@@ -42,3 +42,12 @@ SEARCH_KEYWORDS: list[str] = [
 # ── API ─────────────────────────────────────────────────────────────────────
 API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
 API_PORT: int = int(os.getenv("API_PORT", "8000"))
+CORS_ORIGINS: list[str] = (
+    os.getenv("CORS_ORIGINS", "").split(",")
+    if os.getenv("CORS_ORIGINS")
+    else ["http://localhost:3000", "http://localhost:5173"]
+)
+
+# ── NLP ──────────────────────────────────────────────────────────────────────
+NLP_MIN_CONFIDENCE: float = float(os.getenv("NLP_MIN_CONFIDENCE", "0.5"))
+NLP_BATCH_SIZE: int = int(os.getenv("NLP_BATCH_SIZE", "20"))
