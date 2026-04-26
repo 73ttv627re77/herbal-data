@@ -327,7 +327,7 @@ END $$;
 
 -- Evidence items are standalone scientific citations that can be linked to
 -- multiple remedy+condition pairs. Evidence annotates pairs, never overrides
--- community claims. Linked via evidence_claim_pairs.
+-- community claims. Linked via remedy_condition_evidence.
 CREATE TABLE IF NOT EXISTS evidence_items (
     evidence_item_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -357,22 +357,49 @@ CREATE TABLE IF NOT EXISTS evidence_items (
 
 -- Evidence links to remedy+condition PAIRS (not individual claims)
 -- This is the many-to-many join: one evidence item can support multiple pairs.
-CREATE TABLE IF NOT EXISTS evidence_claim_pairs (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    evidence_item_id    UUID NOT NULL REFERENCES evidence_items(evidence_item_id) ON DELETE CASCADE,
-    remedy_id           UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
-    condition_id        UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
-    finding             TEXT CHECK (finding IN ('effective', 'inconclusive', 'none', 'adverse')),
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT ux_evidence_claim_pairs_pair UNIQUE (evidence_item_id, remedy_id, condition_id)
+-- Named remedy_condition_evidence per Yura's schema design.
+CREATE TABLE IF NOT EXISTS remedy_condition_evidence (
+    remedy_condition_evidence_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    remedy_id                    UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
+    condition_id                 UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    evidence_item_id             UUID NOT NULL REFERENCES evidence_items(evidence_item_id) ON DELETE CASCADE,
+
+    -- Weighting per pairing (for evidence quality/strength at this specific pair)
+    weight                       NUMERIC(4,3) NOT NULL DEFAULT 1.000
+        CHECK (weight >= 0.0 AND weight <= 1.0),
+
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT ux_rce_unique UNIQUE (remedy_id, condition_id, evidence_item_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_evidence_claim_pairs_remedy
-    ON evidence_claim_pairs (remedy_id);
-CREATE INDEX IF NOT EXISTS ix_evidence_claim_pairs_condition
-    ON evidence_claim_pairs (condition_id);
-CREATE INDEX IF NOT EXISTS ix_evidence_claim_pairs_evidence
-    ON evidence_claim_pairs (evidence_item_id);
+CREATE INDEX IF NOT EXISTS ix_rce_remedy_condition
+    ON remedy_condition_evidence (remedy_id, condition_id);
+CREATE INDEX IF NOT EXISTS ix_rce_evidence
+    ON remedy_condition_evidence (evidence_item_id);
+
+-- =============================================================================
+-- 8) SAFETY FLAGS
+-- =============================================================================
+
+-- Keep separate from claims to avoid "advice masquerading as extraction".
+-- Scoped at remedy level or remedy+condition level.
+CREATE TABLE IF NOT EXISTS safety_flags (
+    safety_flag_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    remedy_id            UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
+    condition_id         UUID REFERENCES conditions(id) ON DELETE SET NULL,
+
+    flag                 TEXT NOT NULL,
+    severity             TEXT NOT NULL DEFAULT 'info',
+    reference_url        TEXT,
+
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_safety_flags_remedy
+    ON safety_flags (remedy_id);
+CREATE INDEX IF NOT EXISTS ix_safety_flags_remedy_condition
+    ON safety_flags (remedy_id, condition_id);
 
 -- =============================================================================
 -- 8) USER CONTENT
