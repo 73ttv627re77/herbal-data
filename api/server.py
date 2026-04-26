@@ -366,7 +366,7 @@ async def get_remedy_claims(
         where_sql = "WHERE " + " AND ".join(where_clauses)
 
         base_sql = f"""
-            SELECT c.id, c.claim_summary, c.claim_type, c.polarity,
+            SELECT c.claim_id, c.claim_summary, c.claim_type, c.polarity,
                    c.negation, c.certainty, c.confidence_score,
                    c.method_text, c.dosage_text,
                    c.cultural_tag, c.extracted_span, c.extracted_by, c.extracted_at,
@@ -388,7 +388,7 @@ async def get_remedy_claims(
         claims = []
         for row in rows:
             claim = {
-                "id": str(row["id"]),
+                "id": str(row["claim_id"]),
                 "claim_summary": row["claim_summary"],
                 "polarity": row["polarity"],
                 "confidence_score": float(row["confidence_score"]),
@@ -429,11 +429,11 @@ async def get_remedy_claims(
                 cur.execute(
                     """
                     SELECT cs.claim_id, cs.relevance_score,
-                           sc.id as comment_id, sc.platform, sc.external_id,
+                           sc.source_comment_id, sc.platform, sc.external_id,
                            sc.body, sc.author_hash, sc.score, sc.posted_at,
                            sp.subreddit
                     FROM claim_sources cs
-                    JOIN source_comments sc ON sc.id = cs.comment_id
+                    JOIN source_comments sc ON sc.source_comment_id = cs.source_comment_id
                     JOIN source_posts sp ON sp.id = sc.post_id
                     WHERE cs.claim_id = ANY(%s)
                     ORDER BY cs.relevance_score DESC
@@ -691,7 +691,7 @@ async def list_claims(
         where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
         base_sql = f"""
-            SELECT c.id, c.claim_summary, c.claim_type, c.polarity,
+            SELECT c.claim_id, c.claim_summary, c.claim_type, c.polarity,
                    c.negation, c.certainty, c.confidence_score,
                    c.method_text, c.dosage_text,
                    c.cultural_tag, c.extracted_span, c.extracted_by, c.extracted_at,
@@ -713,7 +713,7 @@ async def list_claims(
         claims = []
         for row in rows:
             claim = {
-                "id": str(row["id"]),
+                "id": str(row["claim_id"]),
                 "claim_summary": row["claim_summary"],
                 "polarity": row["polarity"],
                 "confidence_score": float(row["confidence_score"]),
@@ -749,10 +749,10 @@ async def list_claims(
                 cur.execute(
                     """
                     SELECT cs.claim_id, cs.relevance_score,
-                           sc.id, sc.platform, sc.external_id, sc.body,
+                           sc.source_comment_id, sc.platform, sc.external_id, sc.body,
                            sc.author_hash, sc.score, sc.posted_at, sp.subreddit
                     FROM claim_sources cs
-                    JOIN source_comments sc ON sc.id = cs.comment_id
+                    JOIN source_comments sc ON sc.source_comment_id = cs.source_comment_id
                     JOIN source_posts sp ON sp.id = sc.post_id
                     WHERE cs.claim_id = ANY(%s)
                     """,

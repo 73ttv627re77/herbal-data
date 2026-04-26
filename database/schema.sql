@@ -191,7 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_source_posts_raw_json ON source_posts USING gin(r
 -- ── source_comments ─────────────────────────────────────────────────────────
 -- IMPORTANT: raw_text and raw_json are immutable. is_deleted/is_removed are tombstone flags.
 CREATE TABLE IF NOT EXISTS source_comments (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_comment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     post_id             UUID REFERENCES source_posts(id) ON DELETE CASCADE,
     platform            TEXT NOT NULL,
     external_id         TEXT NOT NULL,
@@ -210,7 +210,6 @@ CREATE TABLE IF NOT EXISTS source_comments (
 
 CREATE INDEX IF NOT EXISTS idx_source_comments_post ON source_comments(post_id);
 CREATE INDEX IF NOT EXISTS idx_source_comments_platform ON source_comments(platform);
-CREATE INDEX IF NOT EXISTS idx_source_comments_community ON source_comments(post_id);
 -- Full-text search index for debugging/discovery
 CREATE INDEX IF NOT EXISTS idx_source_comments_fts
     ON source_comments USING GIN (to_tsvector('simple', body));
@@ -222,94 +221,158 @@ CREATE INDEX IF NOT EXISTS idx_source_comments_fts
 -- Every claim MUST link to at least one source_comment via claim_sources.
 -- No orphan claims. Confidence and unknown states are first-class.
 CREATE TABLE IF NOT EXISTS claims (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    remedy_id       UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
-    condition_id    UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    claim_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    remedy_id            UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
+    condition_id         UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
 
     -- Community framing
-    claim_type      claim_type NOT NULL DEFAULT 'anecdotal',
+    claim_type           claim_type NOT NULL DEFAULT 'anecdotal',
 
     -- Human-readable canonical summary of the claim
-    claim_summary   TEXT NOT NULL,
+    claim_summary        TEXT NOT NULL,
 
     -- Exact extracted phrase from source (preserves original wording)
-    extracted_span  TEXT,
+    extracted_span       TEXT,
 
     -- Polarity / negation / certainty
-    polarity        claim_polarity NOT NULL DEFAULT 'unknown',
-    negation        negation_state NOT NULL DEFAULT 'uncertain',
-    certainty       certainty_level NOT NULL DEFAULT 'unknown',
+    polarity             claim_polarity NOT NULL DEFAULT 'unknown',
+    negation             negation_state NOT NULL DEFAULT 'uncertain',
+    certainty            certainty_level NOT NULL DEFAULT 'unknown',
 
     -- Confidence score 0..1 — always explicit, even if unknown
-    confidence_score NUMERIC(4,3) NOT NULL DEFAULT 0.000
+    confidence_score     NUMERIC(4,3) NOT NULL DEFAULT 0.000
         CHECK (confidence_score >= 0.0 AND confidence_score <= 1.0),
 
     -- Optional structured fields (freeform text in MVP, avoid false precision)
-    method_text     TEXT,
-    dosage_text     TEXT,
-    duration_text   TEXT,
-    route_text      TEXT,
-    culture_tag     TEXT,
+    method_text          TEXT,
+    dosage_text          TEXT,
+    duration_text        TEXT,
+    route_text           TEXT,
+    culture_tag          TEXT,
 
-    -- Provenance
-    extracted_by    extraction_model DEFAULT 'unknown',
-    extracted_at    TIMESTAMPTZ DEFAULT now(),
-    created_at      TIMESTAMPTZ DEFAULT now()
+    -- Extraction lineage (for reprocessing)
+    extractor            extraction_model NOT NULL DEFAULT 'unknown',
+    extractor_version    TEXT,
+    extraction_run_id    UUID,
+    extracted_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Lifecycle
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_claims_remedy ON claims(remedy_id);
-CREATE INDEX IF NOT EXISTS idx_claims_condition ON claims(condition_id);
-CREATE INDEX IF NOT EXISTS idx_claims_confidence ON claims(confidence_score DESC);
-CREATE INDEX IF NOT EXISTS idx_claims_polarity ON claims(polarity);
+-- Common access paths
+CREATE INDEX IF NOT EXISTS ix_claims_remedy_condition
+    ON claims (remedy_id, condition_id);
+CREATE INDEX IF NOT EXISTS ix_claims_polarity
+    ON claims (polarity);
+CREATE INDEX IF NOT EXISTS ix_claims_confidence
+    ON claims (confidence_score DESC);
+-- Full-text search over claim summaries for discovery/debugging
+CREATE INDEX IF NOT EXISTS ix_claims_fts
+    ON claims USING GIN (to_tsvector('simple', claim_summary));
 
--- ── claim_sources (join: claim ↔ source_comment) ────────────────────────────
--- Every claim must have at least one source. This is the enforce rule.
+-- ── claim_sources (provenance — enforces every claim links to ≥1 source) ───
 CREATE TABLE IF NOT EXISTS claim_sources (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    claim_id        UUID NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
-    comment_id      UUID NOT NULL REFERENCES source_comments(id) ON DELETE CASCADE,
-    relevance_score FLOAT DEFAULT 1.0 CHECK (relevance_score >= 0.0 AND relevance_score <= 1.0),
-    created_at      TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(claim_id, comment_id)
+    claim_source_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    claim_id             UUID NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
+    source_comment_id    UUID NOT NULL REFERENCES source_comments(source_comment_id) ON DELETE RESTRICT,
+
+    support_weight       NUMERIC(4,3) NOT NULL DEFAULT 1.000
+        CHECK (support_weight >= 0.0 AND support_weight <= 1.0),
+
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ux_claim_sources_unique UNIQUE (claim_id, source_comment_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_claim_sources_claim ON claim_sources(claim_id);
-CREATE INDEX IF NOT EXISTS idx_claim_sources_comment ON claim_sources(comment_id);
+CREATE INDEX IF NOT EXISTS ix_claim_sources_claim
+    ON claim_sources (claim_id);
+CREATE INDEX IF NOT EXISTS ix_claim_sources_source_comment
+    ON claim_sources (source_comment_id);
+
+-- ── Enforce at least one source per claim (deferrable trigger) ─────────────
+-- Use DEFERRABLE so claim + claim_sources can be inserted in same transaction.
+CREATE OR REPLACE FUNCTION enforce_claim_has_source()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM claim_sources cs
+        WHERE cs.claim_id = NEW.claim_id
+    ) THEN
+        RAISE EXCEPTION 'Claim % must have at least one source_comment in claim_sources',
+            NEW.claim_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_claims_must_have_source'
+    ) THEN
+        CREATE CONSTRAINT TRIGGER trg_claims_must_have_source
+            AFTER INSERT OR UPDATE ON claims
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            EXECUTE FUNCTION enforce_claim_has_source();
+    END IF;
+END $$;
 
 -- =============================================================================
 -- 7) EVIDENCE MODEL
 -- =============================================================================
 
--- Evidence links at remedy+condition pair level — never overrides community claims.
--- Evidence annotates, never justifies.
+-- Evidence items are standalone scientific citations that can be linked to
+-- multiple remedy+condition pairs. Evidence annotates pairs, never overrides
+-- community claims. Linked via evidence_claim_pairs.
 CREATE TABLE IF NOT EXISTS evidence_items (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    remedy_id       UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
-    condition_id    UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    evidence_item_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- Evidence classification
-    evidence_type   evidence_type,
-    quality_score   INT CHECK (quality_score >= 1 AND quality_score <= 5),
-    strength        evidence_strength DEFAULT 'unknown',
+    evidence_type        evidence_type NOT NULL DEFAULT 'other',
+    strength             evidence_strength NOT NULL DEFAULT 'unknown',
 
-    -- Citation
-    title           TEXT,
-    authors         TEXT,
-    pubmed_id       TEXT,
-    doi             TEXT,
-    url             TEXT,
-    year            INT,
+    -- Citation metadata
+    title                TEXT NOT NULL,
+    authors              TEXT,
+    year_published       INTEGER,
+    journal              TEXT,
 
-    -- Finding
-    finding         TEXT CHECK (finding IN ('effective', 'inconclusive', 'none', 'adverse')),
-    summary         TEXT,
+    doi                  TEXT,
+    pmid                 TEXT,
+    url                  TEXT,
 
-    ingested_at     TIMESTAMPTZ DEFAULT now(),
-    created_at      TIMESTAMPTZ DEFAULT now()
+    abstract_text        TEXT,
+    notes                TEXT,
+
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT ux_evidence_doi UNIQUE (doi),
+    CONSTRAINT ux_evidence_pmid UNIQUE (pmid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_evidence_items_remedy ON evidence_items(remedy_id);
-CREATE INDEX IF NOT EXISTS idx_evidence_items_condition ON evidence_items(condition_id);
+-- Evidence links to remedy+condition PAIRS (not individual claims)
+-- This is the many-to-many join: one evidence item can support multiple pairs.
+CREATE TABLE IF NOT EXISTS evidence_claim_pairs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    evidence_item_id    UUID NOT NULL REFERENCES evidence_items(evidence_item_id) ON DELETE CASCADE,
+    remedy_id           UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
+    condition_id        UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    finding             TEXT CHECK (finding IN ('effective', 'inconclusive', 'none', 'adverse')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ux_evidence_claim_pairs_pair UNIQUE (evidence_item_id, remedy_id, condition_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_evidence_claim_pairs_remedy
+    ON evidence_claim_pairs (remedy_id);
+CREATE INDEX IF NOT EXISTS ix_evidence_claim_pairs_condition
+    ON evidence_claim_pairs (condition_id);
+CREATE INDEX IF NOT EXISTS ix_evidence_claim_pairs_evidence
+    ON evidence_claim_pairs (evidence_item_id);
 
 -- =============================================================================
 -- 8) USER CONTENT

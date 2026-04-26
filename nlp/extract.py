@@ -293,11 +293,11 @@ def fetch_unprocessed_comments(conn, batch_size: int) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT sc.id, sc.body, sc.platform, sc.external_id, sp.subreddit
+            SELECT sc.source_comment_id, sc.body, sc.platform, sc.external_id, sp.subreddit
             FROM source_comments sc
             JOIN source_posts sp ON sp.id = sc.post_id
-            WHERE sc.id NOT IN (
-                SELECT DISTINCT cs.comment_id FROM claim_sources cs
+            WHERE sc.source_comment_id NOT IN (
+                SELECT DISTINCT cs.source_comment_id FROM claim_sources cs
             )
             LIMIT %s
             """,
@@ -403,11 +403,11 @@ def link_claim_sources(conn, claim_id: str, comment_id: str, relevance: float = 
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO claim_sources (claim_id, comment_id, relevance_score)
+            INSERT INTO claim_sources (claim_id, source_comment_id, support_weight)
             VALUES (%s, %s, %s)
-            ON CONFLICT (claim_id, comment_id) DO NOTHING
+            ON CONFLICT (claim_id, source_comment_id) DO NOTHING
             """,
-            (claim_id, comment_id, relevance),
+            (claim_id, source_comment_id, relevance),
         )
         conn.commit()
 
@@ -491,7 +491,7 @@ def process_batch(conn, comments: list[dict]) -> tuple[int, int, int]:
                 # Insert claim
                 claim_id = insert_claim(conn, claim, remedy_id, condition_id)
                 if claim_id:
-                    link_claim_sources(conn, claim_id, comment["id"])
+                    link_claim_sources(conn, claim_id, comment["id"], relevance=1.0)
                     created += 1
                 else:
                     skipped += 1
