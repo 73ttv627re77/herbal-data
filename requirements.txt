@@ -1,0 +1,18 @@
+# Herbal Data Pipeline — Python Dependencies
+# Python 3.10+
+
+# Reddit scraping
+praw>=7.7,<8.0
+
+# Database
+psycopg2-binary>=2.9,<3.0
+
+# API
+fastapi>=0.104,<1.0
+uvicorn[standard]>=0.24,<1.0
+
+# NLP / OpenAI
+openai>=1.6,<2.0
+
+# Utilities
+python-dotenv>=1.0,<2.0
