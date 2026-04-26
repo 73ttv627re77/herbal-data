@@ -292,16 +292,17 @@ CREATE INDEX IF NOT EXISTS ix_claim_sources_source_comment
 
 -- ── Enforce at least one source per claim (deferrable trigger) ─────────────
 -- Use DEFERRABLE so claim + claim_sources can be inserted in same transaction.
+-- Only atomic claims must have a source. Clustered claims skip this.
 CREATE OR REPLACE FUNCTION enforce_claim_has_source()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF NOT EXISTS (
+    IF NEW.is_atomic = TRUE AND NOT EXISTS (
         SELECT 1 FROM claim_sources cs
         WHERE cs.claim_id = NEW.claim_id
     ) THEN
-        RAISE EXCEPTION 'Claim % must have at least one source_comment in claim_sources',
+        RAISE EXCEPTION 'Atomic claim % must have at least one source_comment in claim_sources',
             NEW.claim_id;
     END IF;
     RETURN NEW;
@@ -313,6 +314,14 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_trigger WHERE tgname = 'trg_claims_must_have_source'
     ) THEN
+        CREATE CONSTRAINT TRIGGER trg_claims_must_have_source
+            AFTER INSERT OR UPDATE ON claims
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            EXECUTE FUNCTION enforce_claim_has_source();
+    ELSE
+        -- Recreate trigger with updated logic
+        DROP TRIGGER IF EXISTS trg_claims_must_have_source ON claims;
         CREATE CONSTRAINT TRIGGER trg_claims_must_have_source
             AFTER INSERT OR UPDATE ON claims
             DEFERRABLE INITIALLY DEFERRED
@@ -402,7 +411,93 @@ CREATE INDEX IF NOT EXISTS ix_safety_flags_remedy_condition
     ON safety_flags (remedy_id, condition_id);
 
 -- =============================================================================
--- 8) USER CONTENT
+-- 8a) CLAIM CLUSTERS (machine-generated grouping of atomic claims)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS claim_clusters (
+    claim_cluster_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    remedy_id            UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
+    condition_id         UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    cluster_label        TEXT,
+    clusterer            TEXT NOT NULL DEFAULT 'unknown',
+    clusterer_version    TEXT,
+    clustering_run_id    UUID,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_claim_clusters_remedy_condition
+    ON claim_clusters (remedy_id, condition_id);
+
+CREATE TABLE IF NOT EXISTS claim_cluster_members (
+    claim_cluster_member_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    claim_cluster_id         UUID NOT NULL REFERENCES claim_clusters(claim_cluster_id) ON DELETE CASCADE,
+    claim_id                 UUID NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
+    membership_score         NUMERIC(4,3) NOT NULL DEFAULT 1.000
+        CHECK (membership_score >= 0.0 AND membership_score <= 1.0),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ux_cluster_member_unique UNIQUE (claim_cluster_id, claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_claim_cluster_members_cluster
+    ON claim_cluster_members (claim_cluster_id);
+CREATE INDEX IF NOT EXISTS ix_claim_cluster_members_claim
+    ON claim_cluster_members (claim_id);
+
+-- =============================================================================
+-- 8b) CLAIM COLLECTIONS (human-curated / editorial lists)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS claim_collections (
+    claim_collection_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                 TEXT NOT NULL,
+    description          TEXT,
+    created_by           TEXT NOT NULL DEFAULT 'system',
+    is_public            BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS claim_collection_items (
+    claim_collection_item_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    claim_collection_id       UUID NOT NULL REFERENCES claim_collections(claim_collection_id) ON DELETE CASCADE,
+    claim_id                 UUID REFERENCES claims(claim_id) ON DELETE CASCADE,
+    claim_cluster_id         UUID REFERENCES claim_clusters(claim_cluster_id) ON DELETE CASCADE,
+    position                 INTEGER NOT NULL DEFAULT 0,
+    notes                    TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_collection_item_one_ref CHECK (
+        (claim_id IS NOT NULL AND claim_cluster_id IS NULL)
+        OR
+        (claim_id IS NULL AND claim_cluster_id IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_collection_items_collection
+    ON claim_collection_items (claim_collection_id, position);
+
+-- =============================================================================
+-- 8c) ROLLUP VIEW (precomputed stats for fast API)
+-- =============================================================================
+
+CREATE OR REPLACE VIEW v_remedy_condition_rollup AS
+SELECT
+    c.remedy_id,
+    c.condition_id,
+    COUNT(*) AS claim_count,
+    SUM(CASE WHEN c.polarity = 'positive' THEN 1 ELSE 0 END) AS positive_count,
+    SUM(CASE WHEN c.polarity = 'negative' THEN 1 ELSE 0 END) AS negative_count,
+    SUM(CASE WHEN c.polarity = 'mixed' THEN 1 ELSE 0 END) AS mixed_count,
+    AVG(c.confidence_score) AS avg_confidence,
+    MAX(sc.posted_at) AS most_recent_posted_at
+FROM claims c
+JOIN claim_sources cs ON cs.claim_id = c.claim_id
+JOIN source_comments sc ON sc.source_comment_id = cs.source_comment_id
+WHERE c.is_atomic = TRUE
+GROUP BY c.remedy_id, c.condition_id;
+
+-- =============================================================================
+-- 9) USER CONTENT
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS user_testimonials (
@@ -422,7 +517,7 @@ CREATE INDEX IF NOT EXISTS idx_testimonials_remedy ON user_testimonials(remedy_i
 CREATE INDEX IF NOT EXISTS idx_testimonials_condition ON user_testimonials(condition_id);
 
 -- =============================================================================
--- 9) TRIGGERS
+-- 10) TRIGGERS
 -- =============================================================================
 
 -- Update remedies.mention_count when claims are inserted or deleted
