@@ -45,6 +45,25 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'evidence_strength') THEN
         CREATE TYPE evidence_strength AS ENUM ('strong', 'moderate', 'limited', 'mixed', 'none', 'unknown');
     END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'moderation_status') THEN
+        CREATE TYPE moderation_status AS ENUM ('draft', 'pending_review', 'approved', 'rejected', 'flagged', 'archived');
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'moderation_action') THEN
+        CREATE TYPE moderation_action AS ENUM ('create', 'edit', 'approve', 'reject', 'flag', 'archive', 'restore', 'hide', 'unhide');
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'moderation_severity') THEN
+        CREATE TYPE moderation_severity AS ENUM ('info', 'warn', 'high', 'critical');
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'flag_reason') THEN
+        CREATE TYPE flag_reason AS ENUM (
+            'unsafe', 'medical_claim', 'spam', 'off_topic',
+            'duplicate', 'low_quality', 'conflict', 'other'
+        );
+    END IF;
 END $$;
 
 -- =============================================================================
@@ -80,6 +99,19 @@ CREATE TABLE IF NOT EXISTS conditions (
     description     TEXT,
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- ── app_users (moderators / curators) ─────────────────────────────────────
+-- Separate from user_testimonials — this is for staff/system accounts.
+CREATE TABLE IF NOT EXISTS app_users (
+    user_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email           TEXT UNIQUE NOT NULL,
+    display_name    TEXT,
+    role            TEXT NOT NULL DEFAULT 'curator'
+        CHECK (role IN ('admin', 'moderator', 'curator', 'system')),
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- =============================================================================
@@ -221,44 +253,84 @@ CREATE INDEX IF NOT EXISTS idx_source_comments_fts
 -- Every claim MUST link to at least one source_comment via claim_sources.
 -- No orphan claims. Confidence and unknown states are first-class.
 CREATE TABLE IF NOT EXISTS claims (
-    claim_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    remedy_id            UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
-    condition_id         UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    claim_id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    remedy_id                UUID NOT NULL REFERENCES remedies(id) ON DELETE CASCADE,
+    condition_id             UUID NOT NULL REFERENCES conditions(id) ON DELETE CASCADE,
+    claim_type              claim_type NOT NULL DEFAULT 'anecdotal',
 
-    -- Community framing
-    claim_type           claim_type NOT NULL DEFAULT 'anecdotal',
-
-    -- Human-readable canonical summary of the claim
-    claim_summary        TEXT NOT NULL,
-
-    -- Exact extracted phrase from source (preserves original wording)
-    extracted_span       TEXT,
-
-    -- Polarity / negation / certainty
-    polarity             claim_polarity NOT NULL DEFAULT 'unknown',
-    negation             negation_state NOT NULL DEFAULT 'uncertain',
-    certainty            certainty_level NOT NULL DEFAULT 'unknown',
-
-    -- Confidence score 0..1 — always explicit, even if unknown
-    confidence_score     NUMERIC(4,3) NOT NULL DEFAULT 0.000
+    -- Effective fields (API reads these — set by trigger, never write directly)
+    claim_summary           TEXT NOT NULL,
+    extracted_span          TEXT,
+    polarity                claim_polarity NOT NULL DEFAULT 'unknown',
+    negation                negation_state NOT NULL DEFAULT 'uncertain',
+    certainty               certainty_level NOT NULL DEFAULT 'unknown',
+    confidence_score         NUMERIC(4,3) NOT NULL DEFAULT 0.000
         CHECK (confidence_score >= 0.0 AND confidence_score <= 1.0),
+    method_text             TEXT,
+    dosage_text             TEXT,
+    duration_text           TEXT,
+    route_text              TEXT,
+    culture_tag             TEXT,
 
-    -- Optional structured fields (freeform text in MVP, avoid false precision)
-    method_text          TEXT,
-    dosage_text          TEXT,
-    duration_text        TEXT,
-    route_text           TEXT,
-    culture_tag          TEXT,
+    -- Machine output (preserved — NLP output never destroyed by reprocessing)
+    claim_summary_machine           TEXT,
+    extracted_span_machine          TEXT,
+    polarity_machine               claim_polarity,
+    negation_machine               negation_state,
+    certainty_machine              certainty_level,
+    confidence_score_machine        NUMERIC(4,3)
+        CHECK (confidence_score_machine IS NULL OR
+               (confidence_score_machine >= 0.0 AND confidence_score_machine <= 1.0)),
 
-    -- Extraction lineage (for reprocessing)
+    -- Curated overrides (applied when status = approved/pending_review)
+    claim_summary_curated           TEXT,
+    extracted_span_curated          TEXT,
+    method_text_curated            TEXT,
+    dosage_text_curated            TEXT,
+    duration_text_curated          TEXT,
+    route_text_curated             TEXT,
+    culture_tag_curated            TEXT,
+    polarity_curated               claim_polarity,
+    negation_curated               negation_state,
+    certainty_curated              certainty_level,
+    confidence_score_curated       NUMERIC(4,3)
+        CHECK (confidence_score_curated IS NULL OR
+               (confidence_score_curated >= 0.0 AND confidence_score_curated <= 1.0)),
+    curated_by          UUID REFERENCES app_users(user_id) ON DELETE SET NULL,
+    curated_at          TIMESTAMPTZ,
+    curated_note        TEXT,
+
+    -- Moderation
+    mod_status           moderation_status NOT NULL DEFAULT 'draft',
+    is_hidden            BOOLEAN NOT NULL DEFAULT FALSE,
+    rejected_reason      TEXT,
+    moderator_notes      TEXT,
+    reviewed_by         UUID REFERENCES app_users(user_id) ON DELETE SET NULL,
+    reviewed_at         TIMESTAMPTZ,
+    hidden_at           TIMESTAMPTZ,
+    soft_deleted_at     TIMESTAMPTZ,
+
+    -- Extraction lineage
     extractor            extraction_model NOT NULL DEFAULT 'unknown',
     extractor_version    TEXT,
     extraction_run_id    UUID,
     extracted_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    -- Atomic vs aggregated
+    is_atomic           BOOLEAN NOT NULL DEFAULT TRUE,
+    source_span_start   INTEGER NULL,
+    source_span_end     INTEGER NULL,
+
     -- Lifecycle
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT ck_claims_span_valid CHECK (
+        (source_span_start IS NULL AND source_span_end IS NULL)
+        OR
+        (source_span_start IS NOT NULL AND source_span_end IS NOT NULL
+         AND source_span_start >= 0 AND source_span_end > source_span_start)
+    )
 );
 
 -- Common access paths
@@ -268,11 +340,13 @@ CREATE INDEX IF NOT EXISTS ix_claims_polarity
     ON claims (polarity);
 CREATE INDEX IF NOT EXISTS ix_claims_confidence
     ON claims (confidence_score DESC);
--- Full-text search over claim summaries for discovery/debugging
 CREATE INDEX IF NOT EXISTS ix_claims_fts
     ON claims USING GIN (to_tsvector('simple', claim_summary));
-
--- ── claim_sources (provenance — enforces every claim links to ≥1 source) ───
+CREATE INDEX IF NOT EXISTS ix_claims_mod_status
+    ON claims (mod_status);
+CREATE INDEX IF NOT EXISTS ix_claims_curated_at
+    ON claims (curated_at DESC);
+ (provenance — enforces every claim links to ≥1 source) ───
 CREATE TABLE IF NOT EXISTS claim_sources (
     claim_source_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     claim_id             UUID NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
@@ -292,7 +366,173 @@ CREATE INDEX IF NOT EXISTS ix_claim_sources_source_comment
 
 -- ── Enforce at least one source per claim (deferrable trigger) ─────────────
 -- Use DEFERRABLE so claim + claim_sources can be inserted in same transaction.
--- Only atomic claims must have a source. Clustered claims skip this.
+-- ── moderation_events: append-only audit log for all moderation actions ──
+CREATE TABLE IF NOT EXISTS moderation_events (
+    moderation_event_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_type          TEXT NOT NULL,          -- 'claim', 'cluster', 'collection'
+    entity_id            UUID NOT NULL,
+    action               moderation_action NOT NULL,
+    severity             moderation_severity NOT NULL DEFAULT 'info',
+    reason               flag_reason,
+    note                 TEXT,
+    actor_user_id        UUID REFERENCES app_users(user_id) ON DELETE SET NULL,
+    actor_display        TEXT,
+    previous_status      moderation_status,
+    new_status           moderation_status,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_moderation_events_entity
+    ON moderation_events (entity_type, entity_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_moderation_events_actor
+    ON moderation_events (actor_user_id, created_at DESC);
+
+-- ── log_moderation_event helper ─────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION log_moderation_event(
+    p_entity_type    TEXT,
+    p_entity_id      UUID,
+    p_action         moderation_action,
+    p_actor_user_id  UUID,
+    p_actor_display  TEXT,
+    p_prev_status   moderation_status,
+    p_new_status    moderation_status,
+    p_note          TEXT
+) RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO moderation_events (
+        entity_type, entity_id, action, actor_user_id, actor_display,
+        previous_status, new_status, note
+    ) VALUES (
+        p_entity_type, p_entity_id, p_action, p_actor_user_id, p_actor_display,
+        p_prev_status, p_new_status, p_note
+    );
+END;
+$$;
+
+-- ── trg_claims_sync_effective_and_log: sync + audit in one trigger ──────────
+-- Rules:
+-- - Machine fields backfilled on first insert
+-- - If curated fields exist AND status = approved/pending_review → use curated as effective
+-- - Else → use machine as effective
+-- - Any field change logs an event automatically
+CREATE OR REPLACE FUNCTION sync_claim_effective_fields()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_prev_status moderation_status;
+    v_new_status moderation_status;
+BEGIN
+    v_prev_status := COALESCE(OLD.mod_status, 'draft'::moderation_status);
+    v_new_status  := COALESCE(NEW.mod_status, 'draft'::moderation_status);
+
+    -- Backfill machine fields on first insert (preserve NLP output)
+    IF TG_OP = 'INSERT' THEN
+        NEW.claim_summary_machine    := NEW.claim_summary;
+        NEW.extracted_span_machine   := NEW.extracted_span;
+        NEW.polarity_machine        := NEW.polarity;
+        NEW.negation_machine        := NEW.negation;
+        NEW.certainty_machine       := NEW.certainty;
+        NEW.confidence_score_machine := NEW.confidence_score;
+    END IF;
+
+    -- Determine effective fields
+    IF v_new_status IN ('approved', 'pending_review')
+       AND (
+           NEW.claim_summary_curated    IS NOT NULL OR NEW.polarity_curated           IS NOT NULL OR
+           NEW.negation_curated         IS NOT NULL OR NEW.certainty_curated          IS NOT NULL OR
+           NEW.confidence_score_curated IS NOT NULL OR NEW.extracted_span_curated     IS NOT NULL OR
+           NEW.method_text_curated      IS NOT NULL OR NEW.dosage_text_curated        IS NOT NULL OR
+           NEW.duration_text_curated    IS NOT NULL OR NEW.route_text_curated         IS NOT NULL OR
+           NEW.culture_tag_curated      IS NOT NULL
+       ) THEN
+        -- Use curated as effective
+        NEW.claim_summary    := COALESCE(NEW.claim_summary_curated,    NEW.claim_summary_machine, NEW.claim_summary);
+        NEW.extracted_span  := COALESCE(NEW.extracted_span_curated,   NEW.extracted_span_machine);
+        NEW.polarity        := COALESCE(NEW.polarity_curated,         NEW.polarity_machine, NEW.polarity);
+        NEW.negation        := COALESCE(NEW.negation_curated,         NEW.negation_machine, NEW.negation);
+        NEW.certainty       := COALESCE(NEW.certainty_curated,        NEW.certainty_machine, NEW.certainty);
+        NEW.confidence_score:= COALESCE(NEW.confidence_score_curated,NEW.confidence_score_machine, NEW.confidence_score);
+        NEW.method_text     := COALESCE(NEW.method_text_curated,     NEW.method_text);
+        NEW.dosage_text     := COALESCE(NEW.dosage_text_curated,     NEW.dosage_text);
+        NEW.duration_text   := COALESCE(NEW.duration_text_curated,   NEW.duration_text);
+        NEW.route_text      := COALESCE(NEW.route_text_curated,      NEW.route_text);
+        NEW.culture_tag     := COALESCE(NEW.culture_tag_curated,     NEW.culture_tag);
+    ELSE
+        -- Use machine as effective
+        NEW.claim_summary    := COALESCE(NEW.claim_summary_machine,    NEW.claim_summary);
+        NEW.extracted_span  := COALESCE(NEW.extracted_span_machine,   NEW.extracted_span);
+        NEW.polarity        := COALESCE(NEW.polarity_machine,         NEW.polarity);
+        NEW.negation        := COALESCE(NEW.negation_machine,         NEW.negation);
+        NEW.certainty       := COALESCE(NEW.certainty_machine,        NEW.certainty);
+        NEW.confidence_score:= COALESCE(NEW.confidence_score_machine, NEW.confidence_score);
+    END IF;
+
+    NEW.updated_at := now();
+
+    -- Log moderation events
+    IF TG_OP = 'UPDATE' THEN
+        -- Status change event
+        IF v_prev_status IS DISTINCT FROM v_new_status THEN
+            PERFORM log_moderation_event(
+                'claim', NEW.claim_id,
+                CASE v_new_status
+                    WHEN 'approved'    THEN 'approve'::moderation_action
+                    WHEN 'rejected'    THEN 'reject'::moderation_action
+                    WHEN 'flagged'     THEN 'flag'::moderation_action
+                    WHEN 'archived'    THEN 'archive'::moderation_action
+                    WHEN 'pending_review' THEN 'edit'::moderation_action
+                    ELSE 'edit'::moderation_action
+                END,
+                NEW.reviewed_by, NULL,
+                v_prev_status, v_new_status,
+                NEW.moderator_notes
+            );
+        END IF;
+
+        -- Curated field edit event
+        IF (NEW.claim_summary_curated   IS DISTINCT FROM OLD.claim_summary_curated)   OR
+           (NEW.polarity_curated        IS DISTINCT FROM OLD.polarity_curated)        OR
+           (NEW.negation_curated        IS DISTINCT FROM OLD.negation_curated)        OR
+           (NEW.certainty_curated       IS DISTINCT FROM OLD.certainty_curated)      OR
+           (NEW.confidence_score_curated IS DISTINCT FROM OLD.confidence_score_curated) OR
+           (NEW.extracted_span_curated  IS DISTINCT FROM OLD.extracted_span_curated)  OR
+           (NEW.method_text_curated     IS DISTINCT FROM OLD.method_text_curated)    OR
+           (NEW.dosage_text_curated     IS DISTINCT FROM OLD.dosage_text_curated)   OR
+           (NEW.duration_text_curated   IS DISTINCT FROM OLD.duration_text_curated)  OR
+           (NEW.route_text_curated     IS DISTINCT FROM OLD.route_text_curated)    OR
+           (NEW.culture_tag_curated    IS DISTINCT FROM OLD.culture_tag_curated) THEN
+            IF NEW.curated_by IS NULL THEN
+                NEW.curated_by := NEW.reviewed_by;
+            END IF;
+            NEW.curated_at := now();
+            PERFORM log_moderation_event(
+                'claim', NEW.claim_id,
+                'edit'::moderation_action,
+                NEW.curated_by, NULL,
+                v_prev_status, v_new_status,
+                COALESCE(NEW.curated_note, NEW.moderator_notes)
+            );
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_claims_sync_effective_and_log') THEN
+        CREATE TRIGGER trg_claims_sync_effective_and_log
+            BEFORE INSERT OR UPDATE ON claims
+            FOR EACH ROW
+            EXECUTE FUNCTION sync_claim_effective_fields();
+    END IF;
+END $$;
+
+-- ── enforce_claim_has_source (standalone, for atomic claims) ──────────────────
 CREATE OR REPLACE FUNCTION enforce_claim_has_source()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -311,17 +551,7 @@ $$;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_claims_must_have_source'
-    ) THEN
-        CREATE CONSTRAINT TRIGGER trg_claims_must_have_source
-            AFTER INSERT OR UPDATE ON claims
-            DEFERRABLE INITIALLY DEFERRED
-            FOR EACH ROW
-            EXECUTE FUNCTION enforce_claim_has_source();
-    ELSE
-        -- Recreate trigger with updated logic
-        DROP TRIGGER IF EXISTS trg_claims_must_have_source ON claims;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_claims_must_have_source') THEN
         CREATE CONSTRAINT TRIGGER trg_claims_must_have_source
             AFTER INSERT OR UPDATE ON claims
             DEFERRABLE INITIALLY DEFERRED
@@ -423,7 +653,14 @@ CREATE TABLE IF NOT EXISTS claim_clusters (
     clusterer_version    TEXT,
     clustering_run_id    UUID,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Curated overrides for clusters
+    curated_summary          TEXT,
+    conflict_explanation    TEXT,
+    caution_notes          TEXT,
+    curated_by             UUID REFERENCES app_users(user_id) ON DELETE SET NULL,
+    curated_at             TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS ix_claim_clusters_remedy_condition
