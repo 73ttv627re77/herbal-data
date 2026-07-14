@@ -1,0 +1,680 @@
+import json
+import subprocess
+import random
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+
+from scraper import fb_keyword_nightly
+from scraper import fb_reel_night_cron
+
+
+PAGE_NAVIGATE_METHOD = "Page" + "." + "navigate"
+
+
+class FakeCDP:
+    """Minimal fake CDP client used for navigation safety tests."""
+
+    def __init__(self):
+        self.send_calls = []
+
+    def send(self, method, params=None):
+        self.send_calls.append((method, params))
+        return {}
+
+
+def _fake_now(values):
+    values = list(values)
+    state = {"i": 0}
+    if len(values) > 1:
+        step = float(values[-1]) - float(values[-2])
+        if step <= 0:
+            step = 0.1
+    else:
+        step = 0.1
+
+    def now():
+        i = state["i"]
+        state["i"] = i + 1
+        if i >= len(values):
+            if not values:
+                return 0.0 + step * i
+            return float(values[-1]) + (step * (i - len(values) + 1))
+        return float(values[i])
+
+    return now
+
+
+class TestSafetyDetection(unittest.TestCase):
+    """Pure safety state detection tests."""
+
+    def test_login_warning_detection(self):
+        state = {
+            "url": "https://www.facebook.com/login",
+            "title": "Log in to Facebook",
+            "body_text": "Please log in to your Facebook account to continue.",
+        }
+        self.assertEqual(
+            fb_keyword_nightly.parse_facebook_safety_reason(state),
+            fb_keyword_nightly.SAFETY_REASON_LOGIN,
+        )
+
+    def test_checkpoint_warning_detection(self):
+        state = {
+            "url": "https://www.facebook.com/checkpoint/",
+            "title": "Checkpoint",
+            "body_text": "Your account checkpoint was triggered.",
+        }
+        self.assertEqual(
+            fb_keyword_nightly.parse_facebook_safety_reason(state),
+            fb_keyword_nightly.SAFETY_REASON_CHECKPOINT,
+        )
+
+    def test_captcha_warning_detection(self):
+        state = {
+            "url": "https://www.facebook.com",
+            "title": "Facebook",
+            "body_text": "Please verify you are not a robot before continuing.",
+        }
+        self.assertEqual(
+            fb_keyword_nightly.parse_facebook_safety_reason(state),
+            fb_keyword_nightly.SAFETY_REASON_CAPTCHA,
+        )
+
+    def test_action_block_warning_detection(self):
+        state = {
+            "url": "https://www.facebook.com",
+            "title": "Action blocked",
+            "body_text": "This action is temporarily blocked on Facebook.",
+        }
+        self.assertEqual(
+            fb_keyword_nightly.parse_facebook_safety_reason(state),
+            fb_keyword_nightly.SAFETY_REASON_ACTION_BLOCK,
+        )
+
+    def test_auth_challenge_warning_detection(self):
+        state = {
+            "url": "https://www.facebook.com/",
+            "title": "Facebook account verification",
+            "body_text": "This security check asks you to review unusual activity and verify your identity.",
+        }
+        self.assertEqual(
+            fb_keyword_nightly.parse_facebook_safety_reason(state),
+            fb_keyword_nightly.SAFETY_REASON_AUTH_CHALLENGE,
+        )
+
+
+class TestNavigationSafetyPolling(unittest.TestCase):
+    """Navigation polling + warning detection tests."""
+
+    def test_delayed_checkpoint_warning_detected(self):
+        page_states = [
+            {
+                "url": "https://www.facebook.com/",
+                "ready_state": "complete",
+                "title": "",
+                "body_text": "",
+            },
+            {
+                "url": "https://www.facebook.com/checkpoint/",
+                "ready_state": "complete",
+                "title": "Checkpoint required",
+                "body_text": "This checkpoint was triggered on your account.",
+            },
+        ]
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+
+        def page_state_fn(_):
+            return page_states.pop(0) if page_states else {"url": "https://www.facebook.com/"}
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/search/videos/?q=test",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.1,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"], fb_keyword_nightly.SAFETY_REASON_CHECKPOINT
+        )
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            1,
+        )
+
+    def test_delayed_captcha_warning_detected(self):
+        page_states = [
+            {
+                "url": "https://www.facebook.com/",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "",
+            },
+            {
+                "url": "https://www.facebook.com/",
+                "ready_state": "complete",
+                "title": "",
+                "body_text": "Please verify you are not a robot before continuing.",
+            },
+        ]
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+
+        def page_state_fn(_):
+            return page_states.pop(0) if page_states else {"url": "https://www.facebook.com/"}
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/search/videos/?q=abc",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.1,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"], fb_keyword_nightly.SAFETY_REASON_CAPTCHA
+        )
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            1,
+        )
+
+    def test_navigation_verify_timeout_fail_closed(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.5, 1.1, 1.1])
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+
+        def page_state_fn(_):
+            return {
+                "url": "https://www.facebook.com/",
+                "ready_state": "loading",
+                "title": "loading",
+                "body_text": "",
+            }
+
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/search/videos/?q=timeout",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.5,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
+        )
+
+    def test_stopped_state_prevents_second_navigation(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 1.2, 1.3])
+
+        def warning_page_state_fn(_):
+            return {
+                "url": "https://www.facebook.com/checkpoint/",
+                "title": "checkpoint",
+                "body_text": "checkpoint required",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/search/videos/?q=first",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=warning_page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.1,
+        )
+        self.assertFalse(ok)
+        navigations_after_first = len(
+            [m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]
+        )
+        self.assertEqual(navigations_after_first, 1)
+
+        fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/search/videos/?q=second",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+                page_state_fn=lambda _: {
+                    "url": "https://www.facebook.com/search/videos/?q=second",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "ok",
+                },
+                timeout_seconds=2.0,
+                poll_interval_seconds=0.1,
+            )
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            navigations_after_first,
+        )
+
+    def test_navigation_budget_enforced_in_navigation_helper(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.1, 0.2, 0.3, 0.4])
+        first_target = "https://www.facebook.com/search/videos/?q=first"
+        second_target = "https://www.facebook.com/search/videos/?q=second"
+        third_target = "https://www.facebook.com/search/videos/?q=third"
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=2,
+            now_ts=0.0,
+        )
+        self.assertTrue(
+            fb_keyword_nightly.navigate_with_safety(
+                cdp,
+                first_target,
+                state=state,
+                now_fn=now,
+                sleep_fn=lambda _: None,
+                page_state_fn=lambda _, target_url=first_target: {
+                    "url": target_url,
+                    "ready_state": "complete",
+                },
+                timeout_seconds=2.0,
+                poll_interval_seconds=0.1,
+            )
+        )
+        self.assertEqual(state["navigation_count"], 1)
+        self.assertTrue(
+            fb_keyword_nightly.navigate_with_safety(
+                cdp,
+                second_target,
+                state=state,
+                now_fn=now,
+                sleep_fn=lambda _: None,
+                page_state_fn=lambda _, target_url=second_target: {
+                    "url": target_url,
+                    "ready_state": "complete",
+                },
+                timeout_seconds=2.0,
+                poll_interval_seconds=0.1,
+            )
+        )
+        self.assertEqual(state["navigation_count"], 2)
+
+        self.assertFalse(
+            fb_keyword_nightly.navigate_with_safety(
+                cdp,
+                third_target,
+                state=state,
+                now_fn=now,
+                sleep_fn=lambda _: None,
+                page_state_fn=lambda _, target_url=third_target: {
+                    "url": target_url,
+                    "ready_state": "complete",
+                },
+                timeout_seconds=2.0,
+                poll_interval_seconds=0.1,
+            )
+        )
+        self.assertEqual(state["navigation_count"], 2)
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            2,
+        )
+        self.assertEqual(
+            state["stop_reason"],
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_LIMIT,
+        )
+
+    def test_matching_url_is_not_verified_until_ready(self):
+        target = "https://www.facebook.com/search/videos/?q=loading"
+        page_states = [
+            {
+                "url": target,
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "",
+            },
+            {
+                "url": target,
+                "ready_state": "complete",
+                "title": "",
+                "body_text": "Please verify you are not a robot before continuing.",
+            },
+        ]
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+
+        def page_state_fn(_):
+            return page_states.pop(0) if page_states else {"url": target, "ready_state": "complete"}
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.1,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"], fb_keyword_nightly.SAFETY_REASON_CAPTCHA
+        )
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            1,
+        )
+
+
+class TestNavigationSafetyBudget(unittest.TestCase):
+    """Navigation/runtime budget guard tests."""
+
+    def test_navigation_budget(self):
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=60,
+            max_navigations=2,
+            now_ts=0,
+        )
+        self.assertIsNone(fb_keyword_nightly._check_navigation_limits(state, 1.0))
+
+        state["navigation_count"] = 2
+        self.assertEqual(
+            fb_keyword_nightly._check_navigation_limits(state, 1.0),
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_LIMIT,
+        )
+
+    def test_runtime_budget(self):
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=99,
+            now_ts=100.0,
+        )
+        self.assertIsNone(fb_keyword_nightly._check_navigation_limits(state, 109.9))
+        self.assertEqual(
+            fb_keyword_nightly._check_navigation_limits(state, 110.1),
+            fb_keyword_nightly.SAFETY_REASON_RUNTIME_LIMIT,
+        )
+
+
+class TestPauseSelection(unittest.TestCase):
+    """Configurable delay helper tests."""
+
+    def test_inter_reel_delay_bounds(self):
+        rng = random.Random(42)
+        for _ in range(10):
+            pause = fb_keyword_nightly.inter_reel_pause_seconds(rng)
+            self.assertGreaterEqual(pause, fb_keyword_nightly.DEFAULT_MIN_INTER_REEL_PAUSE_SECONDS)
+            self.assertLessEqual(pause, fb_keyword_nightly.DEFAULT_MAX_INTER_REEL_PAUSE_SECONDS)
+
+    def test_source_switch_delay_bounds(self):
+        rng = random.Random(99)
+        for _ in range(10):
+            pause = fb_keyword_nightly.source_switch_pause_seconds(rng)
+            self.assertGreaterEqual(pause, fb_keyword_nightly.DEFAULT_MIN_SOURCE_SWITCH_PAUSE_SECONDS)
+            self.assertLessEqual(pause, fb_keyword_nightly.DEFAULT_MAX_SOURCE_SWITCH_PAUSE_SECONDS)
+
+
+class TestSafetyReporting(unittest.TestCase):
+    """Safety serialization and report rendering tests."""
+
+    def test_save_latest_tracks_safety_fields(self):
+        summary = {
+            "started_at": "2026-07-12T00:00:00",
+            "query": "safety-test",
+            "dry_run": False,
+            "safety_stop": True,
+            "safety_stop_reason": fb_keyword_nightly.SAFETY_REASON_CAPTCHA,
+            "safety_stop_at": "2026-07-12T00:00:00",
+            "candidate_count": 1,
+            "scraped_count": 0,
+            "total_comments": 0,
+            "discovered_count": 0,
+            "new_count": 0,
+            "revisited_count": 0,
+            "skipped_current": 0,
+            "source_count": 0,
+            "explicit_count": 0,
+            "selected_count": 0,
+            "selected_by_reason": {},
+            "output_dir": "/tmp",
+            "errors": ["Safety stop: captcha"],
+            "runtime_seconds": 12,
+            "navigation_count": 5,
+            "navigation_limit": 10,
+            "runtime_limit_seconds": 20,
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            with patch.object(fb_keyword_nightly, "STATE_LATEST", latest_path):
+                fb_keyword_nightly.save_latest(summary)
+
+            data = json.loads(latest_path.read_text())
+
+        self.assertTrue(data["safety_stop"])
+        self.assertEqual(data["safety_stop_reason"], fb_keyword_nightly.SAFETY_REASON_CAPTCHA)
+        self.assertEqual(data["runtime_seconds"], 12)
+        self.assertEqual(data["navigation_count"], 5)
+
+    def test_email_body_mentions_safety_stop(self):
+        latest = {
+            "output_dir": None,
+            "query": "safety-report",
+            "candidate_count": 0,
+            "scraped_count": 0,
+            "total_comments": 0,
+            "safety_stop": True,
+            "safety_stop_reason": fb_keyword_nightly.SAFETY_REASON_CHECKPOINT,
+            "runtime_seconds": 30,
+            "runtime_limit_seconds": 60,
+            "navigation_count": 4,
+            "navigation_limit": 20,
+            "errors": ["Safety stop"],
+        }
+        body = fb_reel_night_cron.build_email_body(
+            latest=latest,
+            returncode=0,
+            stdout="",
+            stderr="",
+            ingest_result=None,
+        )
+
+        self.assertIn("Safety stop: yes", body)
+        self.assertIn(fb_keyword_nightly.SAFETY_REASON_CHECKPOINT, body)
+
+
+class TestReelCronWrapper(unittest.TestCase):
+    """Wrapper behavior tests for fb_reel_night_cron."""
+
+    def test_wrapper_rejects_unchanged_stale_latest_state(self):
+        run_completed = subprocess.CompletedProcess(
+            args=["python", "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
+        )
+        snapshot = {"exists": True, "mtime_ns": 1, "size": 1, "sha256": "same"}
+
+        with patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[snapshot, snapshot]), \
+            patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
+            patch.object(fb_reel_night_cron, "ensure_browser"), \
+            patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
+            patch.object(fb_reel_night_cron, "send_report") as report:
+            exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(ingest.call_count, 0)
+        self.assertTrue(report.called)
+        self.assertEqual(
+            report.call_args.args[0]["errors"][0],
+            "current-run validation failed: latest state did not change for this invocation.",
+        )
+
+    def test_wrapper_rejects_mismatched_invocation_or_output_directory(self):
+        invocation_id = "nightly-2026-001"
+        output_dir = "/tmp/foreign-run"
+        completed = subprocess.CompletedProcess(
+            args=["python", "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            latest_path.write_text(
+                json.dumps({
+                    "run_invocation_id": "other-invocation",
+                    "output_dir": output_dir,
+                    "last_run": datetime.now().isoformat(),
+                    "errors": [],
+                })
+            )
+            pre = {"exists": False}
+            post = {"exists": True, "mtime_ns": 2, "size": latest_path.stat().st_size, "sha256": "x"}
+
+            with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
+                patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
+                patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "run", return_value=completed), \
+                patch.object(fb_reel_night_cron, "ensure_browser"), \
+                patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
+                patch.object(fb_reel_night_cron, "send_report") as report:
+                exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(ingest.call_count, 0)
+        self.assertIn(
+            "does not match this invocation",
+            report.call_args.args[0]["errors"][0],
+        )
+
+    def test_wrapper_accepts_fresh_correlated_latest_state(self):
+        invocation_id = "nightly-2026-002"
+        with tempfile.TemporaryDirectory() as td:
+            latest_dir = Path(td) / f"output-{invocation_id}"
+            latest_dir.mkdir()
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            latest_payload = {
+                "run_invocation_id": invocation_id,
+                "output_dir": str(latest_dir),
+                "last_run": datetime.now().isoformat(),
+                "errors": [],
+            }
+            latest_path.write_text(json.dumps(latest_payload))
+            pre = {"exists": False}
+            post = {"exists": True, "mtime_ns": 3, "size": latest_path.stat().st_size, "sha256": "y"}
+            run_completed = subprocess.CompletedProcess(
+                args=["python", "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
+            )
+            ingest_completed = subprocess.CompletedProcess(
+                args=["python", "ingest_facebook.py"], returncode=0, stdout="", stderr=""
+            )
+
+            with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
+                patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
+                patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
+                patch.object(fb_reel_night_cron, "ensure_browser"), \
+                patch.object(fb_reel_night_cron, "run_keyword_ingest", return_value=ingest_completed) as ingest, \
+                patch.object(fb_reel_night_cron, "send_report") as report:
+                exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 0)
+        ingest.assert_called_once_with(str(latest_dir))
+        self.assertEqual(report.call_args.args[0]["errors"], [])
+
+    def test_wrapper_does_not_ingest_when_current_run_state_is_invalid(self):
+        snapshot = {"exists": True, "mtime_ns": 1, "size": 1, "sha256": "same"}
+        run_completed = subprocess.CompletedProcess(
+            args=["python", "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
+        )
+
+        with patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[snapshot, snapshot]), \
+            patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
+            patch.object(fb_reel_night_cron, "ensure_browser"), \
+            patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
+            patch.object(fb_reel_night_cron, "send_report"):
+            exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 1)
+        ingest.assert_not_called()
+
+    def test_wrapper_outer_inner_failure_yields_nonzero_exit(self):
+        invocation_id = "nightly-2026-003"
+        with tempfile.TemporaryDirectory() as td:
+            latest_dir = Path(td) / f"output-{invocation_id}"
+            latest_dir.mkdir()
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            latest_payload = {
+                "run_invocation_id": invocation_id,
+                "output_dir": str(latest_dir),
+                "last_run": datetime.now().isoformat(),
+                "errors": [],
+            }
+            latest_path.write_text(json.dumps(latest_payload))
+            pre = {"exists": False}
+            post = {"exists": True, "mtime_ns": 4, "size": latest_path.stat().st_size, "sha256": "z"}
+            failed_run = subprocess.CompletedProcess(
+                args=["python", "fb_keyword_nightly.py"], returncode=1, stdout="", stderr="boom"
+            )
+            ingest_completed = subprocess.CompletedProcess(
+                args=["python", "ingest_facebook.py"], returncode=0, stdout="", stderr=""
+            )
+
+            with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
+                patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
+                patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "run", return_value=failed_run), \
+                patch.object(fb_reel_night_cron, "ensure_browser"), \
+                patch.object(fb_reel_night_cron, "run_keyword_ingest", return_value=ingest_completed), \
+                patch.object(fb_reel_night_cron, "send_report"):
+                exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 1)
+
+    def test_invalid_canonicalization_targets_yield_zero_candidates_and_no_navigation(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            with patch.object(fb_keyword_nightly, "ensure_browser") as ensure_browser:
+                summary = fb_keyword_nightly.run_target_urls(
+                    target_urls=["https://www.facebook.com/groups/somegroup", "https://www.facebook.com/watch", "invalid target"],
+                    out_dir=out_dir,
+                )
+
+        self.assertEqual(summary["total_candidates"], 0)
+        self.assertEqual(summary["errors"], ["No valid target URLs supplied"])
+        ensure_browser.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
