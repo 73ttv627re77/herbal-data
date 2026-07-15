@@ -232,6 +232,98 @@ class TestNavigationSafetyPolling(unittest.TestCase):
             fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
         )
 
+    def test_navigation_video_reel_watch_alias_verified_without_false_timeout(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+
+        def page_state_fn(_):
+            return {
+                "url": "https://www.facebook.com/watch/?v=123456",
+                "ready_state": "complete",
+                "title": "",
+                "body_text": "",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/reel/123456/",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.1,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            1,
+        )
+
+    def test_navigation_cross_alias_www_and_m_hosts_is_accepted(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+
+        def page_state_fn(_):
+            return {
+                "url": "https://m.facebook.com/watch/?v=123456",
+                "ready_state": "complete",
+                "title": "",
+                "body_text": "",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/reel/123456/",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.1,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            1,
+        )
+
+    def test_navigation_same_media_id_rejected_on_non_facebook_host(self):
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://facebook.com.evil/reel/123456",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                "https://www.facebook.com/watch/?v=123456",
+            )
+        )
+
+    def test_navigation_same_host_with_mismatched_media_id_rejected(self):
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/reel/999999",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                "https://www.facebook.com/watch/?v=123456",
+            )
+        )
+
     def test_stopped_state_prevents_second_navigation(self):
         cdp = FakeCDP()
         now = _fake_now([0.0, 0.2, 0.4, 1.2, 1.3])
@@ -449,6 +541,44 @@ class TestPauseSelection(unittest.TestCase):
             self.assertLessEqual(pause, fb_keyword_nightly.DEFAULT_MAX_SOURCE_SWITCH_PAUSE_SECONDS)
 
 
+class TestFacebookTargetValidation(unittest.TestCase):
+    """Target host + canonicalization checks."""
+
+    def test_canonicalize_source_url_accepts_facebook_alias_hosts(self):
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://www.facebook.com/watch/?v=123"),
+            "https://www.facebook.com/watch?v=123",
+        )
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://m.facebook.com/watch/?v=123"),
+            "https://m.facebook.com/watch?v=123",
+        )
+
+    def test_canonicalize_source_url_rejects_deceptive_host(self):
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://facebook.com.evil/watch/?v=123"),
+            "",
+        )
+        self.assertFalse(fb_keyword_nightly.is_direct_reel_video_target("https://facebook.com.evil/watch/?v=123"))
+
+    def test_run_target_urls_drops_non_facebook_targets_without_navigation(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            with patch.object(fb_keyword_nightly, "ensure_browser") as ensure_browser:
+                summary = fb_keyword_nightly.run_target_urls(
+                    target_urls=[
+                        "https://facebook.com.evil/reel/111",
+                        "https://evil.example.com/video/222",
+                        "not a url",
+                    ],
+                    out_dir=out_dir,
+                )
+
+        self.assertEqual(summary["total_candidates"], 0)
+        self.assertEqual(summary["errors"], ["No valid target URLs supplied"])
+        ensure_browser.assert_not_called()
+
+
 class TestSafetyReporting(unittest.TestCase):
     """Safety serialization and report rendering tests."""
 
@@ -521,6 +651,8 @@ class TestSafetyReporting(unittest.TestCase):
 class TestReelCronWrapper(unittest.TestCase):
     """Wrapper behavior tests for fb_reel_night_cron."""
 
+    REPO_PYTHON = "/usr/bin/python3"
+
     def test_wrapper_rejects_unchanged_stale_latest_state(self):
         run_completed = subprocess.CompletedProcess(
             args=["python", "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
@@ -528,6 +660,7 @@ class TestReelCronWrapper(unittest.TestCase):
         snapshot = {"exists": True, "mtime_ns": 1, "size": 1, "sha256": "same"}
 
         with patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[snapshot, snapshot]), \
+            patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
             patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
             patch.object(fb_reel_night_cron, "ensure_browser"), \
             patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
@@ -558,13 +691,14 @@ class TestReelCronWrapper(unittest.TestCase):
                     "last_run": datetime.now().isoformat(),
                     "errors": [],
                 })
-            )
+                )
             pre = {"exists": False}
             post = {"exists": True, "mtime_ns": 2, "size": latest_path.stat().st_size, "sha256": "x"}
 
             with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
                 patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
                 patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
                 patch.object(fb_reel_night_cron, "run", return_value=completed), \
                 patch.object(fb_reel_night_cron, "ensure_browser"), \
                 patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
@@ -581,8 +715,8 @@ class TestReelCronWrapper(unittest.TestCase):
     def test_wrapper_accepts_fresh_correlated_latest_state(self):
         invocation_id = "nightly-2026-002"
         with tempfile.TemporaryDirectory() as td:
-            latest_dir = Path(td) / f"output-{invocation_id}"
-            latest_dir.mkdir()
+            latest_dir = Path(td) / "raw" / "facebook_keyword" / invocation_id
+            latest_dir.mkdir(parents=True)
             latest_path = Path(td) / "fb_keyword_latest.json"
             latest_payload = {
                 "run_invocation_id": invocation_id,
@@ -602,7 +736,9 @@ class TestReelCronWrapper(unittest.TestCase):
 
             with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
                 patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
+                patch.object(fb_reel_night_cron, "_expected_output_dir_for_invocation", return_value=str(latest_dir)), \
                 patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
                 patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
                 patch.object(fb_reel_night_cron, "ensure_browser"), \
                 patch.object(fb_reel_night_cron, "run_keyword_ingest", return_value=ingest_completed) as ingest, \
@@ -610,7 +746,7 @@ class TestReelCronWrapper(unittest.TestCase):
                 exit_code = fb_reel_night_cron.main()
 
         self.assertEqual(exit_code, 0)
-        ingest.assert_called_once_with(str(latest_dir))
+        ingest.assert_called_once_with(str(latest_dir), self.REPO_PYTHON)
         self.assertEqual(report.call_args.args[0]["errors"], [])
 
     def test_wrapper_does_not_ingest_when_current_run_state_is_invalid(self):
@@ -620,6 +756,7 @@ class TestReelCronWrapper(unittest.TestCase):
         )
 
         with patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[snapshot, snapshot]), \
+            patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
             patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
             patch.object(fb_reel_night_cron, "ensure_browser"), \
             patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
@@ -654,6 +791,7 @@ class TestReelCronWrapper(unittest.TestCase):
             with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
                 patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
                 patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
                 patch.object(fb_reel_night_cron, "run", return_value=failed_run), \
                 patch.object(fb_reel_night_cron, "ensure_browser"), \
                 patch.object(fb_reel_night_cron, "run_keyword_ingest", return_value=ingest_completed), \
@@ -667,13 +805,101 @@ class TestReelCronWrapper(unittest.TestCase):
             out_dir = Path(td)
             with patch.object(fb_keyword_nightly, "ensure_browser") as ensure_browser:
                 summary = fb_keyword_nightly.run_target_urls(
-                    target_urls=["https://www.facebook.com/groups/somegroup", "https://www.facebook.com/watch", "invalid target"],
+                    target_urls=[
+                        "https://www.facebook.com/groups/somegroup",
+                        "https://facebook.com.evil/watch/123",
+                        "invalid target",
+                    ],
                     out_dir=out_dir,
                 )
 
         self.assertEqual(summary["total_candidates"], 0)
         self.assertEqual(summary["errors"], ["No valid target URLs supplied"])
         ensure_browser.assert_not_called()
+
+    def test_wrapper_rejects_output_dir_substring_collision(self):
+        invocation_id = "nightly-2026-005"
+        with tempfile.TemporaryDirectory() as td:
+            expected_output_dir = Path(td) / "raw" / "facebook_keyword" / invocation_id
+            expected_output_dir.mkdir(parents=True)
+            collision_output_dir = Path(td) / f"{invocation_id}-sibling"
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            latest_payload = {
+                "run_invocation_id": invocation_id,
+                "output_dir": str(collision_output_dir),
+                "last_run": datetime.now().isoformat(),
+                "errors": [],
+            }
+            latest_path.write_text(json.dumps(latest_payload))
+            pre = {"exists": False}
+            post = {"exists": True, "mtime_ns": 4, "size": latest_path.stat().st_size, "sha256": "z"}
+            run_completed = subprocess.CompletedProcess(
+                args=["python", "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
+            )
+
+            with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
+                patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
+                patch.object(fb_reel_night_cron, "_expected_output_dir_for_invocation", return_value=str(expected_output_dir)), \
+                patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
+                patch.object(fb_reel_night_cron, "run", return_value=run_completed), \
+                patch.object(fb_reel_night_cron, "ensure_browser"), \
+                patch.object(fb_reel_night_cron, "run_keyword_ingest") as ingest, \
+                patch.object(fb_reel_night_cron, "send_report") as report:
+                exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(ingest.call_count, 0)
+        self.assertIn(
+            "output_dir does not match this invocation directory contract",
+            report.call_args.args[0]["errors"][0],
+        )
+
+    def test_wrapper_rejects_missing_repo_python_before_scrape(self):
+        with patch.object(fb_reel_night_cron, "select_repo_python", return_value=None), \
+            patch.object(fb_reel_night_cron, "run") as run, \
+            patch.object(fb_reel_night_cron, "ensure_browser") as ensure_browser:
+            exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 1)
+        run.assert_not_called()
+        ensure_browser.assert_not_called()
+
+    def test_wrapper_uses_selected_python_for_keyword_and_ingest(self):
+        invocation_id = "nightly-2026-004"
+        with tempfile.TemporaryDirectory() as td:
+            latest_dir = Path(td) / "raw" / "facebook_keyword" / invocation_id
+            latest_dir.mkdir(parents=True)
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            latest_payload = {
+                "run_invocation_id": invocation_id,
+                "output_dir": str(latest_dir),
+                "last_run": datetime.now().isoformat(),
+                "errors": [],
+            }
+            latest_path.write_text(json.dumps(latest_payload))
+            pre = {"exists": False}
+            post = {"exists": True, "mtime_ns": 4, "size": latest_path.stat().st_size, "sha256": "z"}
+            run_completed = subprocess.CompletedProcess(
+                args=[self.REPO_PYTHON, "fb_keyword_nightly.py"], returncode=0, stdout="", stderr=""
+            )
+            ingest_completed = subprocess.CompletedProcess(
+                args=[self.REPO_PYTHON, "ingest_facebook.py"], returncode=0, stdout="", stderr=""
+            )
+            with patch.object(fb_reel_night_cron, "LATEST", latest_path), \
+                patch.object(fb_reel_night_cron, "current_run_id", return_value=invocation_id), \
+                patch.object(fb_reel_night_cron, "_expected_output_dir_for_invocation", return_value=str(latest_dir)), \
+                patch.object(fb_reel_night_cron, "latest_state_snapshot", side_effect=[pre, post]), \
+                patch.object(fb_reel_night_cron, "select_repo_python", return_value=self.REPO_PYTHON), \
+                patch.object(fb_reel_night_cron, "run", return_value=run_completed) as run, \
+                patch.object(fb_reel_night_cron, "ensure_browser"), \
+                patch.object(fb_reel_night_cron, "run_keyword_ingest", return_value=ingest_completed) as ingest, \
+                patch.object(fb_reel_night_cron, "send_report"):
+                exit_code = fb_reel_night_cron.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run.call_args.args[0], [self.REPO_PYTHON, str(fb_reel_night_cron.SCRIPT), "--max-candidates", "10", "--max-scrape", "3"])
+        ingest.assert_called_once_with(str(latest_dir), self.REPO_PYTHON)
 
 
 if __name__ == "__main__":

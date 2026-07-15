@@ -46,6 +46,7 @@ STATE_SOURCE = STATE_DIR / "fb_source_crawl_state.json"
 DEFAULT_MAX_DISCOVER_PER_SOURCE = 5
 RUN_INVOCATION_ENV_VAR = "FB_KEYWORD_RUN_INVOCATION_ID"
 RUN_INVOCATION_ID_MAX_LEN = 96
+FACEBOOK_ALLOWED_HOSTS = {"facebook.com", "m.facebook.com", "www.facebook.com"}
 CURRENT_POST_WINDOW_DAYS = 14
 REVISIT_INTERVAL_DAYS_RECENT = 7
 REVISIT_INTERVAL_DAYS_OLDER = 30
@@ -77,6 +78,12 @@ def _safe_float(value: str, default: float) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _is_approved_facebook_host(host: Optional[str]) -> bool:
+    if not host:
+        return False
+    return str(host).strip().lower().rstrip(".") in FACEBOOK_ALLOWED_HOSTS
 
 
 def parse_facebook_safety_reason(page_state: dict) -> Optional[str]:
@@ -245,6 +252,23 @@ def _safe_invocation_id(raw_invocation_id: str) -> str:
     return safe[:RUN_INVOCATION_ID_MAX_LEN]
 
 
+def _extract_navigation_media_id(url: str) -> Optional[str]:
+    parsed = urllib.parse.urlsplit(str(url).strip())
+    if not parsed.path:
+        return None
+    path = parsed.path.rstrip("/")
+    if path.startswith("/watch"):
+        values = urllib.parse.parse_qs(parsed.query).get("v", [])
+        if values and values[0]:
+            return str(values[0]).strip().lower()
+
+    match = re.search(r"/(?:reel|videos?)/([0-9]+)", path)
+    if match:
+        return match.group(1)
+
+    return None
+
+
 def _is_navigation_destination_reached(page_state: dict, target_url: str) -> bool:
     target = _normalize_navigation_url(target_url)
     current = _normalize_navigation_url(str(page_state.get("url", "")))
@@ -255,6 +279,15 @@ def _is_navigation_destination_reached(page_state: dict, target_url: str) -> boo
         return False
     parsed_target = urllib.parse.urlsplit(target)
     parsed_current = urllib.parse.urlsplit(current)
+    if not _is_approved_facebook_host(parsed_target.hostname) or not _is_approved_facebook_host(
+        parsed_current.hostname
+    ):
+        return False
+
+    target_media_id = _extract_navigation_media_id(target)
+    current_media_id = _extract_navigation_media_id(current)
+    if target_media_id and current_media_id and target_media_id == current_media_id:
+        return True
     target_netloc = parsed_target.netloc.lower()
     if not target_netloc:
         return target == current
@@ -626,16 +659,19 @@ def canonicalize_source_url(url: str) -> str:
     normalized = url.strip()
     if normalized.startswith("//"):
         normalized = "https:" + normalized
-    if normalized.startswith("/"):
+    elif normalized.startswith("/"):
         normalized = "https://www.facebook.com" + normalized
-    parsed = urllib.parse.urlsplit(normalized)
-    if not parsed.scheme:
-        parsed = urllib.parse.urlsplit("https://www.facebook.com/" + normalized.lstrip("/"))
-    if not parsed.netloc:
-        return normalized
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", normalized):
+        normalized = "https://" + normalized
 
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc
+    parsed = urllib.parse.urlsplit(normalized)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    if not _is_approved_facebook_host(parsed.hostname):
+        return ""
+
+    scheme = parsed.scheme.lower() or "https"
+    netloc = parsed.hostname.lower()
     path = (parsed.path or "/").rstrip("/")
     query = parsed.query or ""
 
@@ -682,6 +718,8 @@ def is_direct_reel_video_target(url: str) -> bool:
     if not normalized:
         return False
     parsed = urllib.parse.urlsplit(normalized)
+    if not _is_approved_facebook_host(parsed.hostname):
+        return False
     path = parsed.path or ""
     query = urllib.parse.parse_qs(parsed.query)
     share_reel_token = path[len("/share/r/"):] if path.startswith("/share/r/") else ""

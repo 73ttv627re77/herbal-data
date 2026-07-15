@@ -25,6 +25,46 @@ TARGETS = REPO / "state" / "fb_reel_targets.json"
 EMAIL_ENV = Path("/Users/openclaw/.openclaw-credentials/email.env")
 EMAIL_TO = "yurazaicev@gmail.com"
 RUN_INVOCATION_ENV_VAR = "FB_KEYWORD_RUN_INVOCATION_ID"
+PYTHON_VERSION_MINIMUM = (3, 10)
+RUN_INVOCATION_ID_MAX_LEN = 96
+REPO_PYTHON_CANDIDATES = (
+    REPO / "venv" / "bin" / "python",
+    REPO / ".venv" / "bin" / "python",
+)
+REPO_PYTHON_VERSION_COMMAND = "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")"
+
+
+def _python_version_tuple(path: str) -> Optional[tuple[int, int]]:
+    try:
+        result = subprocess.run(
+            [path, "-c", REPO_PYTHON_VERSION_COMMAND],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    version = (result.stdout or "").strip().split(".", 2)
+    if len(version) < 2:
+        return None
+    try:
+        return (int(version[0]), int(version[1]))
+    except Exception:
+        return None
+
+
+def select_repo_python() -> Optional[str]:
+    for candidate in REPO_PYTHON_CANDIDATES:
+        if not candidate.exists():
+            continue
+        version = _python_version_tuple(str(candidate))
+        if version is None:
+            continue
+        if version >= PYTHON_VERSION_MINIMUM:
+            return str(candidate)
+    return None
 
 
 def run(
@@ -170,10 +210,21 @@ def _current_run_latest_payload(
             )
 
     output_dir = str(payload.get("output_dir", "")).strip()
-    if expected_id and expected_id not in output_dir:
-        return payload, (
-            "current-run validation failed: latest output_dir does not belong to this invocation."
-        )
+    if expected_id:
+        expected_output_dir = _expected_output_dir_for_invocation(expected_id)
+        if not output_dir:
+            return payload, (
+                "current-run validation failed: latest output_dir does not match this invocation directory contract."
+            )
+        try:
+            if Path(output_dir).resolve() != Path(expected_output_dir).resolve():
+                return payload, (
+                    "current-run validation failed: latest output_dir does not match this invocation directory contract."
+                )
+        except Exception:
+            return payload, (
+                "current-run validation failed: latest output_dir is not a valid path for this invocation."
+            )
 
     try:
         last_run = str(payload.get("last_run", ""))
@@ -229,16 +280,49 @@ def _normalize_output_dir(output_dir: Optional[str]) -> Optional[str]:
     return str(path)
 
 
-def run_keyword_ingest(output_dir: Optional[str]) -> subprocess.CompletedProcess[str]:
-    if not output_dir:
+def _safe_invocation_id(raw_invocation_id: str) -> str:
+    token = str(raw_invocation_id).strip()
+    if not token:
+        return ""
+    safe_chars: list[str] = []
+    for ch in token:
+        if ch.isalnum() or ch in "_.-":
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("-")
+    safe = "".join(safe_chars).strip("._-")
+    if not safe:
+        return ""
+    return safe[:RUN_INVOCATION_ID_MAX_LEN]
+
+
+def _expected_output_dir_for_invocation(invocation_id: str) -> str:
+    invocation = _safe_invocation_id(str(invocation_id))
+    if not invocation:
+        return ""
+    return str(REPO / "raw" / "facebook_keyword" / invocation)
+
+
+def run_keyword_ingest(
+    output_dir: Optional[str],
+    python_executable: str,
+) -> subprocess.CompletedProcess[str]:
+    if not python_executable:
         return subprocess.CompletedProcess(
             args=[sys.executable, str(INGEST_SCRIPT)],
+            returncode=1,
+            stdout="",
+            stderr="No compatible Python interpreter selected for ingest; aborting ingest.",
+        )
+    if not output_dir:
+        return subprocess.CompletedProcess(
+            args=[python_executable, str(INGEST_SCRIPT)],
             returncode=1,
             stdout="",
             stderr="No keyword output_dir provided; skipping ingest.\n",
         )
     cmd = [
-        sys.executable,
+        python_executable,
         str(INGEST_SCRIPT),
         "--skip-facebook-posts",
         "--facebook-keyword-output-dir",
@@ -471,10 +555,20 @@ def send_report(
 
 
 def main() -> int:
+    python_executable = select_repo_python()
+    if not python_executable:
+        print(
+            "No compatible Python interpreter found in repo venv paths. "
+            "Expected: /Users/openclaw/.openclaw/workspace/herbal-data/venv/bin/python "
+            "or .venv/bin/python running Python 3.10+.",
+            file=sys.stderr,
+        )
+        return 1
+
     ensure_browser()
     run_invocation_id = current_run_id()
     cmd = [
-        sys.executable,
+        python_executable,
         str(SCRIPT),
         "--max-candidates",
         "10",
@@ -535,20 +629,20 @@ def main() -> int:
     )
     try:
         if valid_latest_for_ingest:
-            ingest_result = run_keyword_ingest(latest.get("output_dir"))
+            ingest_result = run_keyword_ingest(latest.get("output_dir"), python_executable)
             print("ingest_stdout=" + ingest_result.stdout)
             if ingest_result.stderr:
                 print(f"ingest_stderr={ingest_result.stderr}", file=sys.stderr)
         else:
             ingest_result = subprocess.CompletedProcess(
-                args=[sys.executable, str(INGEST_SCRIPT)],
+                args=[python_executable, str(INGEST_SCRIPT)],
                 returncode=1,
                 stdout="",
                 stderr="No eligible current invocation output to ingest.",
             )
     except Exception as exc:
         ingest_result = subprocess.CompletedProcess(
-            args=[sys.executable, str(INGEST_SCRIPT)],
+            args=[python_executable, str(INGEST_SCRIPT)],
             returncode=1,
             stdout="",
             stderr=f"Ingest run failed before execute: {exc}",
