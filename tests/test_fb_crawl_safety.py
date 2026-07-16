@@ -17,11 +17,14 @@ PAGE_NAVIGATE_METHOD = "Page" + "." + "navigate"
 class FakeCDP:
     """Minimal fake CDP client used for navigation safety tests."""
 
-    def __init__(self):
+    def __init__(self, runtime_evaluate_responses=None):
         self.send_calls = []
+        self.runtime_evaluate_responses = list(runtime_evaluate_responses or [])
 
     def send(self, method, params=None):
         self.send_calls.append((method, params))
+        if method == "Runtime.evaluate" and self.runtime_evaluate_responses:
+            return self.runtime_evaluate_responses.pop(0)
         return {}
 
 
@@ -296,6 +299,198 @@ class TestNavigationSafetyPolling(unittest.TestCase):
         self.assertEqual(
             len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
             1,
+        )
+
+    def test_navigation_verification_defaults_to_safety_page_state(self):
+        target_url = "https://www.facebook.com/watch/?v=123456"
+        runtime_state = {
+            "result": {
+                "value": {
+                    "url": target_url,
+                    "title": "",
+                    "ready_state": "complete",
+                    "body_text": "",
+                }
+            }
+        }
+        cdp = FakeCDP(runtime_evaluate_responses=[runtime_state])
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target_url,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            timeout_seconds=1.5,
+            poll_interval_seconds=0.2,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(state["stop_reason"], "")
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == PAGE_NAVIGATE_METHOD]),
+            1,
+        )
+        self.assertEqual(
+            len([m for m in cdp.send_calls if m[0] == "Runtime.evaluate"]),
+            1,
+        )
+
+        probe_cdp = FakeCDP(runtime_evaluate_responses=[runtime_state])
+        observed_state = fb_keyword_nightly._safety_page_state(probe_cdp)
+        self.assertEqual(observed_state.get("ready_state"), "complete")
+        self.assertEqual(observed_state.get("url"), target_url)
+
+    def test_navigation_verification_rejects_missing_ready_state(self):
+        target_url = "https://www.facebook.com/watch/?v=123456"
+        cdp = FakeCDP(
+            runtime_evaluate_responses=[
+                {
+                    "result": {
+                        "value": {
+                            "url": target_url,
+                            "title": "",
+                            "body_text": "",
+                        }
+                    }
+                }
+            ]
+        )
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target_url,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.2,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
+        )
+
+    def test_navigation_verification_rejects_malformed_runtime_state_shape(self):
+        target_url = "https://www.facebook.com/watch/?v=123456"
+        cdp = FakeCDP(
+            runtime_evaluate_responses=[
+                {"unexpected": {"shape": True}},
+            ]
+        )
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target_url,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.2,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
+        )
+
+    def test_adapter_navigation_verification_accepts_double_nested_runtime_shape(self):
+        target_url = "https://www.facebook.com/watch/?v=123456"
+        cdp = FakeCDP(
+            runtime_evaluate_responses=[
+                {
+                    "result": {
+                        "result": {
+                            "value": {
+                                "url": target_url,
+                                "title": "",
+                                "ready_state": "complete",
+                                "body_text": "",
+                            }
+                        }
+                    }
+                }
+            ]
+        )
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target_url,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.2,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            "",
+        )
+
+    def test_adapter_navigation_verification_accepts_flat_runtime_shape(self):
+        target_url = "https://www.facebook.com/watch/?v=123456"
+        cdp = FakeCDP(
+            runtime_evaluate_responses=[
+                {
+                    "value": {
+                        "url": target_url,
+                        "title": "",
+                        "ready_state": "complete",
+                        "body_text": "",
+                    }
+                }
+            ]
+        )
+        now = _fake_now([0.0, 0.2, 0.4, 0.6])
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target_url,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.2,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            "",
         )
 
     def test_navigation_same_media_id_rejected_on_non_facebook_host(self):

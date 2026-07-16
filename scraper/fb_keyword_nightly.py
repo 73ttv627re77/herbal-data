@@ -216,13 +216,20 @@ def _safety_page_state(cdp: "CDP") -> dict:
         "})();"
     )
     r = cdp.send("Runtime.evaluate", {"expression": expr, "returnByValue": True})
-    result = r.get("result", {}).get("value", {})
-    if not isinstance(result, dict):
-        return {"url": "", "title": "", "body_text": ""}
+    result = r.get("result", {})
+    value = result.get("value") if isinstance(result, dict) else None
+    if not isinstance(value, dict):
+        nested_result = result.get("result") if isinstance(result, dict) else None
+        value = nested_result.get("value") if isinstance(nested_result, dict) else None
+        if not isinstance(value, dict):
+            value = r.get("value")
+            if not isinstance(value, dict):
+                return {"url": "", "title": "", "body_text": "", "ready_state": ""}
     return {
-        "url": str(result.get("url", "")),
-        "title": str(result.get("title", "")),
-        "body_text": str(result.get("body_text", "")),
+        "url": str(value.get("url", "")),
+        "title": str(value.get("title", "")),
+        "ready_state": str(value.get("ready_state", "")),
+        "body_text": str(value.get("body_text", "")),
     }
 
 
