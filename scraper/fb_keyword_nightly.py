@@ -248,6 +248,40 @@ def _normalize_navigation_url(url: str) -> str:
     ).lower()
 
 
+def _is_profile_reels_tab_redirect(target_url: str, current_url: str) -> bool:
+    target = urllib.parse.urlsplit(str(target_url).strip())
+    current = urllib.parse.urlsplit(str(current_url).strip())
+
+    if not target.hostname or not current.hostname:
+        return False
+    if not _is_approved_facebook_host(target.hostname) or not _is_approved_facebook_host(
+        current.hostname
+    ):
+        return False
+
+    target_path = (target.path or "/").rstrip("/") or "/"
+    if target_path != "/profile.php":
+        return False
+
+    target_query = urllib.parse.parse_qs(target.query)
+    if target_query.get("sk", [None])[0] != "reels_tab":
+        return False
+    if not target_query.get("id", [None])[0]:
+        return False
+
+    current_path = (current.path or "/").rstrip("/") or "/"
+    if current.query:
+        return False
+
+    parts = [part for part in current_path.split("/") if part]
+    if len(parts) != 2:
+        return False
+    if parts[1] != "reels":
+        return False
+
+    return True
+
+
 def _safe_invocation_id(raw_invocation_id: str) -> str:
     token = str(raw_invocation_id).strip()
     if not token:
@@ -290,6 +324,8 @@ def _is_navigation_destination_reached(page_state: dict, target_url: str) -> boo
         parsed_current.hostname
     ):
         return False
+    if _is_profile_reels_tab_redirect(target, current):
+        return True
 
     target_media_id = _extract_navigation_media_id(target)
     current_media_id = _extract_navigation_media_id(current)

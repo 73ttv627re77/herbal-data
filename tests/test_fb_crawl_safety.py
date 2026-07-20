@@ -519,6 +519,78 @@ class TestNavigationSafetyPolling(unittest.TestCase):
             )
         )
 
+    def test_navigation_reached_accepts_profile_php_reels_tab_to_canonical_reels(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+        current = "https://www.facebook.com/drericberg/reels/"
+        self.assertTrue(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": current,
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_wrong_tab(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=all_posts"
+        current = "https://www.facebook.com/drericberg/reels/"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": current,
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_reels_tab_to_unrelated_destination(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/about",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_reels_tab_with_deceptive_host(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://facebook.com.evil/drericberg/reels/",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_incomplete_document_for_profile_php_redirect(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/reels/",
+                    "ready_state": "loading",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
     def test_stopped_state_prevents_second_navigation(self):
         cdp = FakeCDP()
         now = _fake_now([0.0, 0.2, 0.4, 1.2, 1.3])
