@@ -2,6 +2,7 @@ import json
 import subprocess
 import random
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,43 @@ class FakeCDP:
         if method == "Runtime.evaluate" and self.runtime_evaluate_responses:
             return self.runtime_evaluate_responses.pop(0)
         return {}
+
+
+class FakeWebSocketFactory:
+    class Base:
+        def __init__(self, recv_schedule, connect_delay_values):
+            self.recv_schedule = list(recv_schedule)
+            self.connect_calls = []
+            self.settimeout_calls = []
+            self.send_calls = []
+            self.recv_calls = []
+            self.closed = False
+            self.connect_delay_values = list(connect_delay_values)
+
+        def connect(self, ws_url, timeout=None, suppress_origin=True):
+            self.connect_calls.append((ws_url, timeout, suppress_origin))
+            if self.connect_delay_values:
+                delay = self.connect_delay_values.pop(0)
+                if delay:
+                    time.sleep(delay)
+
+        def settimeout(self, timeout):
+            self.settimeout_calls.append(timeout)
+
+        def recv(self):
+            self.recv_calls.append(len(self.recv_calls) + 1)
+            if not self.recv_schedule:
+                raise RuntimeError("No recv schedule entries remain")
+            action = self.recv_schedule.pop(0)
+            if isinstance(action, BaseException):
+                raise action
+            return action
+
+        def send(self, payload):
+            self.send_calls.append(payload)
+
+        def close(self):
+            self.closed = True
 
 
 def _fake_now(values):
@@ -107,6 +145,43 @@ class TestSafetyDetection(unittest.TestCase):
             fb_keyword_nightly.parse_facebook_safety_reason(state),
             fb_keyword_nightly.SAFETY_REASON_AUTH_CHALLENGE,
         )
+
+
+class TestCDPTimeoutSafety(unittest.TestCase):
+    """CDP connection timeout handling tests."""
+
+    def test_cdp_connect_preserves_connect_timeout_and_resets_recv_timeout(self):
+        fake = FakeWebSocketFactory.Base(
+            recv_schedule=[RuntimeError("receiver shutdown")],
+            connect_delay_values=[],
+        )
+
+        with patch.object(fb_keyword_nightly.websocket, "WebSocket", lambda: fake):
+            fb_keyword_nightly.CDP("ws://test-host/devtools/page/1")
+
+        self.assertEqual(fake.connect_calls[0], ("ws://test-host/devtools/page/1", 15, True))
+        self.assertGreaterEqual(len(fake.settimeout_calls), 1)
+        self.assertIsNone(fake.settimeout_calls[0])
+
+    def test_cdp_receiver_continues_after_timeout_error(self):
+        fake = FakeWebSocketFactory.Base(
+            recv_schedule=[
+                TimeoutError("recv timeout"),
+                json.dumps({"id": 1, "result": {"ok": True}}),
+                RuntimeError("receiver shutdown"),
+            ],
+            connect_delay_values=[],
+        )
+
+        with patch.object(fb_keyword_nightly.websocket, "WebSocket", lambda: fake):
+            cdp = fb_keyword_nightly.CDP("ws://test-host/devtools/page/2")
+
+        deadline = time.monotonic() + 0.5
+        while len(fake.recv_calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(fake.recv_calls), 3)
+        self.assertEqual(len(cdp._events), 1)
+        self.assertEqual(cdp._events[0], {"id": 1, "result": {"ok": True}})
 
 
 class TestNavigationSafetyPolling(unittest.TestCase):

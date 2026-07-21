@@ -763,6 +763,15 @@ class CDP:
     def __init__(self, ws_url: str):
         self.ws = websocket.WebSocket()
         self.ws.connect(ws_url, timeout=15, suppress_origin=True)
+        try:
+            self.ws.settimeout(None)
+        except Exception:
+            sock = getattr(self.ws, "sock", None)
+            if sock is not None:
+                try:
+                    sock.settimeout(None)
+                except Exception:
+                    pass
         self.msg_id = 0
         self._events = []
 
@@ -772,7 +781,16 @@ class CDP:
                     msg = self.ws.recv()
                     if msg:
                         self._events.append(json.loads(msg))
-                except Exception:
+                except TimeoutError:
+                    continue
+                except Exception as exc:
+                    ws_timeout_exc = getattr(
+                        getattr(websocket, "_exceptions", None),
+                        "WebSocketTimeoutException",
+                        None,
+                    )
+                    if ws_timeout_exc and isinstance(exc, ws_timeout_exc):
+                        continue
                     break
 
         self._rt = threading.Thread(target=receiver, daemon=True)
