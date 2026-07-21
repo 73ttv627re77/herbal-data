@@ -235,6 +235,265 @@ class TestNavigationSafetyPolling(unittest.TestCase):
             fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
         )
 
+    def test_navigation_verify_timeout_records_bounded_redacted_evidence(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8])
+
+        def page_state_fn(_):
+            return {
+                "url": "https://www.facebook.com/search/videos/?q=private+token+value&src=feed",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "this should not be emitted to diagnostics",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        with patch.object(fb_keyword_nightly, "MAX_NAVIGATION_VERIFY_SAMPLES", 3):
+            ok = fb_keyword_nightly.navigate_with_safety(
+                cdp,
+                "https://www.facebook.com/search/videos/?q=private+token+value",
+                state=state,
+                now_fn=now,
+                sleep_fn=lambda _: None,
+                page_state_fn=page_state_fn,
+                timeout_seconds=1.8,
+                poll_interval_seconds=0.2,
+            )
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
+        )
+        evidence = state.get("navigation_verification") or {}
+        self.assertEqual(evidence.get("outcome"), fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT)
+        samples = evidence.get("samples", [])
+        self.assertLessEqual(len(samples), 3)
+        self.assertGreater(len(samples), 0)
+        final = evidence.get("final")
+        self.assertIsInstance(final, dict)
+        self.assertEqual(final, samples[-1])
+
+        first = samples[0]
+        self.assertTrue(isinstance(first.get("poll_ordinal"), int))
+        self.assertTrue(isinstance(first.get("elapsed_ms"), (int, float)))
+        self.assertIn("url", first)
+        self.assertIn("ready_state", first)
+        self.assertIn("payload_usable", first)
+        self.assertIn("destination_match", first)
+        self.assertIn("approved_host", first["url"])
+        self.assertEqual(first["url"]["approved_host"], True)
+        self.assertTrue(first["payload_usable"])
+        self.assertFalse("body_text" in first["url"])
+        self.assertFalse("body_text" in first)
+
+    def test_navigation_verify_timeout_bounded_by_max_samples(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6])
+
+        def page_state_fn(_):
+            return {
+                "url": "https://www.facebook.com/search/videos/?q=timeout",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "hidden",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        with patch.object(fb_keyword_nightly, "MAX_NAVIGATION_VERIFY_SAMPLES", 2):
+            ok = fb_keyword_nightly.navigate_with_safety(
+                cdp,
+                "https://www.facebook.com/search/videos/?q=timeout",
+                state=state,
+                now_fn=now,
+                sleep_fn=lambda _: None,
+                page_state_fn=page_state_fn,
+                timeout_seconds=2.0,
+                poll_interval_seconds=0.2,
+            )
+        self.assertFalse(ok)
+        evidence = state["navigation_verification"]
+        self.assertEqual(evidence["max_samples"], 2)
+        self.assertEqual(len(evidence["samples"]), 2)
+        self.assertEqual(evidence["samples"][-1], evidence["final"])
+        self.assertNotIn("title", evidence["samples"][-1])
+        self.assertNotIn("body_text", evidence["samples"][-1])
+
+    def test_navigation_verify_evidence_redacts_query_values_and_path(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6, 0.8])
+
+        page_states = [
+            {
+                "url": "https://www.facebook.com/reel/123456789012345678901234567890?__a=1&foo=secret-token",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "forbidden text",
+            },
+            {
+                "url": "https://www.facebook.com/reel/123456789012345678901234567890?__a=1&foo=secret-token",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "forbidden text",
+            },
+            {
+                "url": "https://www.facebook.com/reel/123456789012345678901234567890",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "forbidden text",
+            },
+        ]
+
+        def page_state_fn(_):
+            return page_states.pop(0) if page_states else {
+                "url": "https://www.facebook.com/reel/123456789012345678901234567890",
+                "ready_state": "loading",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            "https://www.facebook.com/reel/99999999",
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=0.8,
+            poll_interval_seconds=0.2,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            state["stop_reason"],
+            fb_keyword_nightly.SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
+        )
+
+        evidence = state["navigation_verification"]
+        samples = evidence["samples"]
+        self.assertGreaterEqual(len(samples), 1)
+        flattened_keys = sorted(evidence["samples"][-1]["url"].keys())
+        self.assertIn("query_keys", flattened_keys)
+        self.assertIn("path_shape", flattened_keys)
+        self.assertEqual(evidence["samples"][-1]["url"]["host"], "www.facebook.com")
+        self.assertIn("<id>", evidence["samples"][-1]["url"]["path_shape"])
+        self.assertNotIn("secret-token", evidence["samples"][-1]["url"]["path_shape"])
+        self.assertNotIn("=", repr(evidence["samples"][-1]["url"]))
+        self.assertNotIn("body_text", evidence["samples"][-1]["url"])
+
+    def test_navigation_verify_success_sample_is_redacted(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6, 0.8])
+        target = "https://www.facebook.com/reel/123456?__a=1&token=private-token-value"
+        page_states = [
+            {
+                "url": "https://www.facebook.com/search/videos/?q=other",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "forbidden title",
+            },
+            {
+                "url": "https://www.facebook.com/watch/?v=123456",
+                "ready_state": "complete",
+                "title": "Watch page title",
+                "body_text": "forbidden body",
+            },
+        ]
+
+        def page_state_fn(_):
+            return page_states.pop(0) if page_states else {
+                "url": "https://www.facebook.com/watch/?v=123456",
+                "ready_state": "complete",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.2,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(state["stop_reason"], "")
+        evidence = state["navigation_verification"]
+        final = evidence["final"]
+        self.assertEqual(final["destination_match"], True)
+        self.assertTrue(final["payload_usable"])
+        self.assertNotIn("title", final)
+        self.assertNotIn("body_text", final)
+        self.assertNotIn("title", final["url"])
+        self.assertNotIn("body_text", final["url"])
+        self.assertIn("query_keys", final["url"])
+        self.assertIn("ready_state", evidence["samples"][-1])
+        self.assertTrue("payload_usable" in evidence["samples"][-1])
+
+    def test_navigation_verify_success_records_destination_match(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6, 0.8])
+        target = "https://www.facebook.com/reel/123456"
+        page_states = [
+            {
+                "url": "https://www.facebook.com/search/videos/?q=final",
+                "ready_state": "loading",
+                "title": "",
+                "body_text": "",
+            },
+            {
+                "url": "https://www.facebook.com/watch/?v=123456",
+                "ready_state": "complete",
+                "title": "",
+                "body_text": "",
+            },
+        ]
+
+        def page_state_fn(_):
+            return page_states.pop(0) if page_states else {
+                "url": "https://www.facebook.com/watch/?v=123456",
+                "ready_state": "complete",
+            }
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        ok = fb_keyword_nightly.navigate_with_safety(
+            cdp,
+            target,
+            state=state,
+            now_fn=now,
+            sleep_fn=lambda _: None,
+            page_state_fn=page_state_fn,
+            timeout_seconds=2.0,
+            poll_interval_seconds=0.2,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(state["stop_reason"], "")
+        evidence = state["navigation_verification"]
+        self.assertEqual(evidence["outcome"], "verified")
+        self.assertEqual(evidence["target"]["host"], "www.facebook.com")
+        self.assertGreaterEqual(len(evidence["samples"]), 2)
+        self.assertEqual(evidence["samples"][-1]["ready_state"], "complete")
+        self.assertTrue(evidence["samples"][-1]["destination_match"])
+        self.assertEqual(evidence["final"], evidence["samples"][-1])
+
     def test_navigation_video_reel_watch_alias_verified_without_false_timeout(self):
         cdp = FakeCDP()
         now = _fake_now([0.0, 0.2, 0.4, 0.6])
@@ -887,6 +1146,141 @@ class TestSafetyReporting(unittest.TestCase):
         self.assertEqual(data["safety_stop_reason"], fb_keyword_nightly.SAFETY_REASON_CAPTCHA)
         self.assertEqual(data["runtime_seconds"], 12)
         self.assertEqual(data["navigation_count"], 5)
+
+    def test_save_latest_persists_navigation_verification_without_raw_fields(self):
+        cdp = FakeCDP()
+        now = _fake_now([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        raw_secret_title = "Secret title that should not persist"
+        raw_secret_body = "Secret body that should not persist"
+        raw_secret_token = "oauth-token-secret-value"
+        raw_secret_cookie = "session=super-secret-cookie"
+
+        page_states = [
+            {
+                "url": "https://www.facebook.com/search/videos/?q=private-token-value&x=secret&oauth_token=oauth-token-secret-value",
+                "ready_state": "loading",
+                "title": raw_secret_title,
+                "body_text": raw_secret_body,
+                "cookies": {"session": raw_secret_cookie},
+                "tokens": {"api": raw_secret_token},
+            },
+            {
+                "url": "https://www.facebook.com/search/videos/?q=private-token-value&x=secret&oauth_token=oauth-token-secret-value",
+                "ready_state": "loading",
+                "title": "Another secret title",
+                "body_text": "Another secret body",
+                "cookies": {"session": raw_secret_cookie},
+                "tokens": {"api": raw_secret_token},
+            },
+            {
+                "url": "https://www.facebook.com/search/videos/?q=private-token-value&x=secret&oauth_token=oauth-token-secret-value",
+                "ready_state": "loading",
+                "title": "Another secret title",
+                "body_text": "Another secret body",
+                "cookies": {"session": raw_secret_cookie},
+                "tokens": {"api": raw_secret_token},
+            },
+        ]
+
+        def page_state_fn(_):
+            return (
+                page_states.pop(0)
+                if page_states
+                else {
+                    "url": "https://www.facebook.com/search/videos/?q=private-token-value&x=secret&oauth_token=oauth-token-secret-value",
+                    "ready_state": "loading",
+                }
+            )
+
+        state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=10,
+            max_navigations=5,
+            now_ts=0.0,
+        )
+        with patch.object(fb_keyword_nightly, "MAX_NAVIGATION_VERIFY_SAMPLES", 2):
+            ok = fb_keyword_nightly.navigate_with_safety(
+                cdp,
+                "https://www.facebook.com/search/videos/?q=private-token-value&x=secret",
+                state=state,
+                now_fn=now,
+                sleep_fn=lambda _: None,
+                page_state_fn=page_state_fn,
+                timeout_seconds=1.4,
+                poll_interval_seconds=0.2,
+            )
+        self.assertFalse(ok)
+        state["navigation_verification"]["max_samples"] = (
+            fb_keyword_nightly.MAX_NAVIGATION_VERIFY_SAMPLES + 10
+        )
+        summary = {
+            "started_at": "2026-07-12T00:00:00",
+            "query": "safe-latest",
+            "dry_run": False,
+            "candidates": [],
+            "scraped": [],
+            "tasks": [],
+            "total_candidates": 0,
+            "total_scraped": 0,
+            "total_comments": 0,
+            "errors": [],
+            "output_dir": "/tmp",
+            "target_urls": [],
+            "selected_by_reason": {
+                "explicit": 0,
+                "latest": 0,
+                "backfill": 0,
+                "revisit": 0,
+            },
+            "discovered_count": 0,
+            "new_count": 0,
+            "revisited_count": 0,
+            "skipped_current": 0,
+            "selected_count": 0,
+            "explicit_count": 0,
+            "source_count": 0,
+            "safety_stop": False,
+            "safety_stop_reason": "",
+            "safety_stop_at": "",
+            "runtime_seconds": 0,
+            "navigation_count": 0,
+            "navigation_limit": 0,
+            "runtime_limit_seconds": 0,
+        }
+        fb_keyword_nightly.attach_safety_summary(summary, state)
+
+        with tempfile.TemporaryDirectory() as td:
+            latest_path = Path(td) / "fb_keyword_latest.json"
+            with patch.object(fb_keyword_nightly, "STATE_LATEST", latest_path):
+                fb_keyword_nightly.save_latest(summary)
+            data = json.loads(latest_path.read_text())
+
+        evidence = data["navigation_verification"]
+        self.assertLessEqual(len(evidence["samples"]), 2)
+        self.assertEqual(
+            evidence["max_samples"],
+            fb_keyword_nightly.MAX_NAVIGATION_VERIFY_SAMPLES,
+        )
+        self.assertTrue(evidence.get("final"))
+        rendered = json.dumps(evidence)
+        self.assertNotIn(raw_secret_title, rendered)
+        self.assertNotIn(raw_secret_body, rendered)
+        self.assertNotIn("Another secret title", rendered)
+        self.assertNotIn("Another secret body", rendered)
+        self.assertNotIn(raw_secret_token, rendered)
+        self.assertNotIn(raw_secret_cookie, rendered)
+        self.assertNotIn("private-token-value", rendered)
+        self.assertNotIn("q=private-token-value", rendered)
+        self.assertNotIn("x=secret", rendered)
+        self.assertNotIn("oauth_token=oauth-token-secret-value", rendered)
+        final_sample = evidence["samples"][-1]
+        self.assertIn("query_keys", final_sample["url"])
+        final_query_keys = set(final_sample["url"]["query_keys"])
+        self.assertIn("q", final_query_keys)
+        self.assertIn("x", final_query_keys)
+        self.assertNotIn("body_text", final_sample["url"])
+        self.assertNotIn("title", final_sample)
+        self.assertNotIn("cookies", final_sample)
+        self.assertNotIn("tokens", final_sample)
 
     def test_email_body_mentions_safety_stop(self):
         latest = {

@@ -67,8 +67,11 @@ SAFETY_REASON_NAVIGATION_LIMIT = "facebook-navigation-limit-exceeded"
 SAFETY_REASON_RUNTIME_LIMIT = "facebook-runtime-limit-exceeded"
 SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT = "facebook-navigation-verify-timeout"
 
-DEFAULT_NAVIGATION_VERIFY_TIMEOUT_SECONDS = 8.0
-DEFAULT_NAVIGATION_VERIFY_POLL_SECONDS = 0.25
+MAX_NAVIGATION_VERIFY_TIMEOUT_SECONDS = 8.0
+MAX_NAVIGATION_VERIFY_POLL_SECONDS = 0.25
+MAX_NAVIGATION_VERIFY_SAMPLES = 6
+MAX_NAVIGATION_VERIFY_PATH_SHAPE_CHARS = 96
+MAX_NAVIGATION_VERIFY_QUERY_KEYS = 6
 
 
 # ── CDP client ────────────────────────────────────────────────────────────────
@@ -78,6 +81,216 @@ def _safe_float(value: str, default: float) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _truncate_for_evidence(value: object, max_length: int) -> str:
+    text = str(value)
+    if max_length <= 0:
+        return ""
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return f"{text[:max_length - 3]}..."
+
+
+def _normalize_path_shape(path: str) -> str:
+    raw_path = str(path).strip()
+    if not raw_path:
+        return "/"
+    if raw_path != "/":
+        raw_path = raw_path.rstrip("/") or "/"
+    parts = [part for part in raw_path.split("/") if part]
+    if not parts:
+        return "/"
+    transformed = []
+    for part in parts:
+        if re.fullmatch(r"[0-9]+", part):
+            transformed.append("<id>")
+        elif re.fullmatch(r"[0-9A-Za-z_-]{24,}", part):
+            transformed.append("<token>")
+        else:
+            transformed.append(part)
+    return "/" + "/".join(transformed)
+
+
+def _build_navigation_url_evidence(url: str) -> dict:
+    parsed = urllib.parse.urlsplit(str(url).strip())
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    approved_host = _is_approved_facebook_host(host)
+    query = urllib.parse.parse_qs(parsed.query)
+    if not query:
+        query = {}
+    query_keys = sorted(query.keys())
+    query_has_more = len(query_keys) > MAX_NAVIGATION_VERIFY_QUERY_KEYS
+    if len(query_keys) > MAX_NAVIGATION_VERIFY_QUERY_KEYS:
+        query_keys = query_keys[:MAX_NAVIGATION_VERIFY_QUERY_KEYS]
+    return {
+        "approved_host": approved_host,
+        "host": host if approved_host else "<redacted-host>",
+        "path_shape": _truncate_for_evidence(
+            _normalize_path_shape(parsed.path or "/"),
+            MAX_NAVIGATION_VERIFY_PATH_SHAPE_CHARS,
+        ),
+        "query_keys": query_keys,
+        "query_has_more": bool(query_has_more),
+        "has_query": bool(parsed.query),
+    }
+
+
+def _coerce_navigation_sample_limit(value: object) -> int:
+    try:
+        max_samples = int(value)
+    except Exception:
+        max_samples = MAX_NAVIGATION_VERIFY_SAMPLES
+    if max_samples <= 0:
+        max_samples = MAX_NAVIGATION_VERIFY_SAMPLES
+    return min(max_samples, MAX_NAVIGATION_VERIFY_SAMPLES)
+
+
+def _append_navigation_verification_sample(
+    state: dict,
+    target_url: str,
+    page_state: object,
+    now_ts: float,
+    started_ts: float,
+    poll_ordinal: int,
+    destination_match: bool,
+) -> None:
+    if not isinstance(state, dict):
+        return
+
+    evidence = state.setdefault("navigation_verification", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+        state["navigation_verification"] = evidence
+
+    evidence.setdefault("target", _build_navigation_url_evidence(target_url))
+    evidence["target_match"] = bool(destination_match)
+    evidence.setdefault("max_samples", MAX_NAVIGATION_VERIFY_SAMPLES)
+    evidence.setdefault("poll_interval_seconds", 0.0)
+    evidence.setdefault("timeout_seconds", 0.0)
+    evidence.setdefault("started_at", float(started_ts))
+    samples = evidence.setdefault("samples", [])
+    if not isinstance(samples, list):
+        samples = []
+        evidence["samples"] = samples
+    max_samples = _coerce_navigation_sample_limit(evidence.get("max_samples", MAX_NAVIGATION_VERIFY_SAMPLES))
+    evidence["max_samples"] = max_samples
+
+    current_url = ""
+    ready_state = ""
+    payload_usable = False
+    if isinstance(page_state, dict):
+        current_url = str(page_state.get("url", "") or "")
+        ready_state = str(page_state.get("ready_state", "") or "")
+        payload_usable = "url" in page_state and "ready_state" in page_state
+    url_evidence = _build_navigation_url_evidence(current_url)
+
+    sample = {
+        "poll_ordinal": int(poll_ordinal),
+        "elapsed_ms": round((float(now_ts) - float(started_ts)) * 1000.0, 3),
+        "ready_state": _truncate_for_evidence(ready_state, 32),
+        "approved_host": bool(url_evidence.get("approved_host", False)),
+        "destination_match": bool(destination_match),
+        "payload_usable": bool(payload_usable),
+        "url": url_evidence,
+    }
+    samples.append(sample)
+    max_samples = evidence.get("max_samples", MAX_NAVIGATION_VERIFY_SAMPLES)
+    if len(samples) > max_samples:
+        del samples[: len(samples) - max_samples]
+    evidence["samples"] = samples
+
+
+def _mark_navigation_verification_complete(state: dict, status: str, now_ts: float) -> None:
+    evidence = state.get("navigation_verification")
+    if not isinstance(evidence, dict):
+        return
+    evidence["outcome"] = str(status)
+    evidence["ended_at"] = round(float(now_ts), 3)
+    started_at = float(evidence.get("started_at", now_ts))
+    evidence["elapsed_seconds"] = round(float(now_ts) - started_at, 3)
+    samples = evidence.get("samples")
+    if isinstance(samples, list) and samples:
+        evidence["final"] = samples[-1]
+
+
+def _coerce_navigation_url_evidence(value: object) -> dict:
+    if not isinstance(value, dict):
+        return _build_navigation_url_evidence(value)
+    approved_host = bool(value.get("approved_host", False))
+    host = str(value.get("host", ""))
+    if not approved_host:
+        host = "<redacted-host>"
+    return {
+        "approved_host": approved_host,
+        "host": host,
+        "path_shape": _truncate_for_evidence(
+            str(value.get("path_shape", "")),
+            MAX_NAVIGATION_VERIFY_PATH_SHAPE_CHARS,
+        ),
+        "query_keys": [
+            str(q) for q in sorted(value.get("query_keys", []))
+        ][:MAX_NAVIGATION_VERIFY_QUERY_KEYS],
+        "query_has_more": bool(value.get("query_has_more", False)),
+        "has_query": bool(value.get("has_query", False)),
+    }
+
+
+def _coerce_navigation_verification_sample(sample: object) -> Optional[dict]:
+    if not isinstance(sample, dict):
+        return None
+
+    return {
+        "poll_ordinal": int(sample.get("poll_ordinal", 0)),
+        "elapsed_ms": round(float(sample.get("elapsed_ms", 0.0)), 3),
+        "ready_state": _truncate_for_evidence(str(sample.get("ready_state", "")), 32),
+        "approved_host": bool(sample.get("approved_host", False)),
+        "destination_match": bool(sample.get("destination_match", False)),
+        "payload_usable": bool(sample.get("payload_usable", False)),
+        "url": _coerce_navigation_url_evidence(sample.get("url")),
+    }
+
+
+def _coerce_navigation_verification_for_summary(evidence: object) -> Optional[dict]:
+    if not isinstance(evidence, dict):
+        return None
+    coerced_target = _coerce_navigation_url_evidence(evidence.get("target", {}))
+    max_samples = _coerce_navigation_sample_limit(evidence.get("max_samples", MAX_NAVIGATION_VERIFY_SAMPLES))
+    raw_samples = evidence.get("samples", [])
+    samples: list[dict] = []
+    if isinstance(raw_samples, list):
+        for sample in raw_samples:
+            coerced_sample = _coerce_navigation_verification_sample(sample)
+            if isinstance(coerced_sample, dict):
+                samples.append(coerced_sample)
+        if max_samples and len(samples) > max_samples:
+            samples = samples[-max_samples:]
+
+    result = {
+        "target": coerced_target,
+        "target_match": bool(evidence.get("target_match", False)),
+        "max_samples": max_samples,
+        "poll_interval_seconds": round(float(evidence.get("poll_interval_seconds", 0.0)), 3),
+        "timeout_seconds": round(float(evidence.get("timeout_seconds", 0.0)), 3),
+        "started_at": round(float(evidence.get("started_at", 0.0)), 3),
+        "samples": samples,
+    }
+    if evidence.get("outcome") is not None:
+        result["outcome"] = str(evidence.get("outcome", ""))
+    if evidence.get("ended_at") is not None:
+        result["ended_at"] = round(float(evidence.get("ended_at", 0.0)), 3)
+    if evidence.get("elapsed_seconds") is not None:
+        result["elapsed_seconds"] = round(float(evidence.get("elapsed_seconds", 0.0)), 3)
+    if isinstance(evidence.get("final"), dict):
+        final_sample = _coerce_navigation_verification_sample(evidence.get("final"))
+        if isinstance(final_sample, dict):
+            result["final"] = final_sample
+    elif samples:
+        result["final"] = samples[-1]
+
+    return result
 
 
 def _is_approved_facebook_host(host: Optional[str]) -> bool:
@@ -371,21 +584,48 @@ def _wait_for_navigation_verified(
     sleep_fn: Callable[[float], None],
     page_state_fn: Callable[["CDP"], dict],
     *,
-    timeout_seconds: float = DEFAULT_NAVIGATION_VERIFY_TIMEOUT_SECONDS,
-    poll_interval_seconds: float = DEFAULT_NAVIGATION_VERIFY_POLL_SECONDS,
+    timeout_seconds: float = MAX_NAVIGATION_VERIFY_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = MAX_NAVIGATION_VERIFY_POLL_SECONDS,
 ) -> bool:
     timeout_seconds = float(max(0.0, timeout_seconds))
-    deadline = float(now_fn()) + timeout_seconds
+    start_ts = float(now_fn())
+    deadline = float(start_ts) + timeout_seconds
     interval = float(max(0.0, poll_interval_seconds))
     if interval > 0:
         max_iteration_count = max(1, int(timeout_seconds / interval) + 2)
     else:
         max_iteration_count = 1
 
+    verification = state.setdefault("navigation_verification", {})
+    if not isinstance(verification, dict):
+        verification = {}
+        state["navigation_verification"] = verification
+    verification["target"] = _build_navigation_url_evidence(target_url)
+    verification["started_at"] = start_ts
+    verification["timeout_seconds"] = timeout_seconds
+    verification["poll_interval_seconds"] = interval
+    verification["max_samples"] = int(MAX_NAVIGATION_VERIFY_SAMPLES)
+    verification["samples"] = []
+    verification["outcome"] = ""
+
     iteration_count = 0
     while True:
         iteration_count += 1
         if iteration_count > max_iteration_count:
+            _append_navigation_verification_sample(
+                state,
+                target_url,
+                {},
+                float(now_fn()),
+                verification["started_at"],
+                iteration_count,
+                False,
+            )
+            _mark_navigation_verification_complete(
+                state,
+                SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT,
+                float(now_fn()),
+            )
             _mark_safety_stop(
                 state, SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT, float(now_fn())
             )
@@ -401,19 +641,48 @@ def _wait_for_navigation_verified(
         ) >= float(state.get("max_runtime_seconds", 0)):
             reason = SAFETY_REASON_RUNTIME_LIMIT
         if reason:
+            _append_navigation_verification_sample(
+                state,
+                target_url,
+                {},
+                now_ts,
+                verification["started_at"],
+                iteration_count,
+                False,
+            )
+            _mark_navigation_verification_complete(state, reason, now_ts)
             _mark_safety_stop(state, reason, now_ts)
             return False
 
         page_state = page_state_fn(cdp)
         reason = parse_facebook_safety_reason(page_state)
+        destination_match = False
+        if isinstance(page_state, dict):
+            destination_match = _is_navigation_destination_reached(
+                page_state, target_url
+            )
+        _append_navigation_verification_sample(
+            state,
+            target_url,
+            page_state,
+            now_ts,
+            verification["started_at"],
+            iteration_count,
+            destination_match,
+        )
         if reason:
+            _mark_navigation_verification_complete(state, reason, now_ts)
             _mark_safety_stop(state, reason, now_ts)
             return False
 
-        if _is_navigation_destination_reached(page_state, target_url):
+        if destination_match:
+            _mark_navigation_verification_complete(state, "verified", now_ts)
             return True
 
         if now_ts >= deadline:
+            _mark_navigation_verification_complete(
+                state, SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT, now_ts
+            )
             _mark_safety_stop(state, SAFETY_REASON_NAVIGATION_VERIFY_TIMEOUT, now_ts)
             return False
 
@@ -451,8 +720,8 @@ def navigate_with_safety(
     detect_after_navigation: bool = True,
     sleep_fn: Callable[[float], None] = time.sleep,
     page_state_fn: Optional[Callable[["CDP"], dict]] = None,
-    timeout_seconds: float = DEFAULT_NAVIGATION_VERIFY_TIMEOUT_SECONDS,
-    poll_interval_seconds: float = DEFAULT_NAVIGATION_VERIFY_POLL_SECONDS,
+    timeout_seconds: float = MAX_NAVIGATION_VERIFY_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = MAX_NAVIGATION_VERIFY_POLL_SECONDS,
 ) -> bool:
     """
     Navigate via CDP only if run safety limits are not exceeded.
@@ -1910,6 +2179,11 @@ def attach_safety_summary(
     summary["navigation_limit"] = int(safety_state.get("max_navigations", 0))
     summary["runtime_limit_seconds"] = int(safety_state.get("max_runtime_seconds", 0))
     summary["runtime_seconds"] = round(runtime_seconds, 3)
+    navigation_verification = _coerce_navigation_verification_for_summary(
+        safety_state.get("navigation_verification")
+    )
+    if isinstance(navigation_verification, dict):
+        summary["navigation_verification"] = navigation_verification
 
     if safety_state.get("stopped"):
         stop_reason = str(safety_state.get("stop_reason", ""))
@@ -1950,6 +2224,11 @@ def save_latest(summary: dict) -> None:
         "output_dir": summary.get("output_dir", ""),
         "errors": summary.get("errors", []),
     }
+    navigation_verification = _coerce_navigation_verification_for_summary(
+        summary.get("navigation_verification")
+    )
+    if isinstance(navigation_verification, dict):
+        latest["navigation_verification"] = navigation_verification
     with open(STATE_LATEST, "w") as f:
         json.dump(latest, f, indent=2)
     print(f"Latest summary -> {STATE_LATEST}")
