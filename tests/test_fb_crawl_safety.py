@@ -1,5 +1,6 @@
 import json
 import subprocess
+from types import SimpleNamespace
 import random
 import tempfile
 import time
@@ -163,22 +164,30 @@ class TestCDPTimeoutSafety(unittest.TestCase):
         self.assertGreaterEqual(len(fake.settimeout_calls), 1)
         self.assertIsNone(fake.settimeout_calls[0])
 
-    def test_cdp_receiver_continues_after_timeout_error(self):
+    def test_cdp_receiver_continues_after_websocket_timeout_exception(self):
+        fake_timeout_exception = type(
+            "FakeWebSocketTimeoutException", (Exception,), {}
+        )
         fake = FakeWebSocketFactory.Base(
             recv_schedule=[
-                TimeoutError("recv timeout"),
+                fake_timeout_exception("recv timeout"),
                 json.dumps({"id": 1, "result": {"ok": True}}),
                 RuntimeError("receiver shutdown"),
             ],
             connect_delay_values=[],
         )
 
-        with patch.object(fb_keyword_nightly.websocket, "WebSocket", lambda: fake):
-            cdp = fb_keyword_nightly.CDP("ws://test-host/devtools/page/2")
+        with patch.object(
+            fb_keyword_nightly.websocket,
+            "_exceptions",
+            SimpleNamespace(WebSocketTimeoutException=fake_timeout_exception),
+            create=True,
+        ):
+            with patch.object(fb_keyword_nightly.websocket, "WebSocket", lambda: fake):
+                cdp = fb_keyword_nightly.CDP("ws://test-host/devtools/page/2")
 
-        deadline = time.monotonic() + 0.5
-        while len(fake.recv_calls) < 3 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        cdp._rt.join(timeout=1.0)
+        self.assertFalse(cdp._rt.is_alive())
         self.assertEqual(len(fake.recv_calls), 3)
         self.assertEqual(len(cdp._events), 1)
         self.assertEqual(cdp._events[0], {"id": 1, "result": {"ok": True}})
