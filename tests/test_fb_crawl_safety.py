@@ -5,7 +5,10 @@ import random
 import tempfile
 import time
 import unittest
-from datetime import datetime
+import sys
+import io
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +31,9 @@ class FakeCDP:
         if method == "Runtime.evaluate" and self.runtime_evaluate_responses:
             return self.runtime_evaluate_responses.pop(0)
         return {}
+
+    def close(self):
+        self.send_calls.append(("close", None))
 
 
 class FakeWebSocketFactory:
@@ -877,6 +883,50 @@ class TestNavigationSafetyPolling(unittest.TestCase):
             )
         )
 
+    def test_navigation_reached_accepts_profile_php_main_to_canonical_profile(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264"
+        current = "https://www.facebook.com/drericberg"
+        self.assertTrue(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": current,
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_videos_without_expected_query(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        current = "https://www.facebook.com/drericberg/videos/"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": current,
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_videos_tab_to_deceptive_host(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://facebook.com.evil/drericberg/videos/?id=100047211517264&sk=videos",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
     def test_navigation_reached_rejects_profile_php_wrong_tab(self):
         target = "https://www.facebook.com/profile.php?id=100047211517264&sk=all_posts"
         current = "https://www.facebook.com/drericberg/reels/"
@@ -884,6 +934,91 @@ class TestNavigationSafetyPolling(unittest.TestCase):
             fb_keyword_nightly._is_navigation_destination_reached(
                 {
                     "url": current,
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_reels_tab_with_query_bearing_destination(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/reels/?ref=timeline",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_accepts_profile_php_videos_tab_to_canonical_videos_with_query(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        current = "https://www.facebook.com/drericberg/videos/?id=100047211517264&sk=videos#"
+        self.assertTrue(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": current,
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_videos_tab_with_wrong_path_depth(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/videos/reels/",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_videos_tab_with_wrong_surface_suffix(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/reels",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_videos_tab_with_extra_query(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/videos/?id=100047211517264&sk=videos&ref=timeline",
+                    "ready_state": "complete",
+                    "title": "",
+                    "body_text": "",
+                },
+                target,
+            )
+        )
+
+    def test_navigation_reached_rejects_profile_php_videos_tab_with_mismatched_query(self):
+        target = "https://www.facebook.com/profile.php?id=100047211517264&sk=videos"
+        self.assertFalse(
+            fb_keyword_nightly._is_navigation_destination_reached(
+                {
+                    "url": "https://www.facebook.com/drericberg/videos/?id=111111&sk=videos",
                     "ready_state": "complete",
                     "title": "",
                     "body_text": "",
@@ -1187,6 +1322,278 @@ class TestFacebookTargetValidation(unittest.TestCase):
         self.assertEqual(summary["total_candidates"], 0)
         self.assertEqual(summary["errors"], ["No valid target URLs supplied"])
         ensure_browser.assert_not_called()
+
+    def test_discovery_canonicalizes_mixed_creator_content_urls(self):
+        raw_links = [
+            "/user1/reel/111?foo=1",
+            "/user2/videos/222",
+            "https://www.facebook.com/watch/?v=333",
+            "https://www.facebook.com/user/posts/444?utm=one",
+            "https://www.facebook.com/permalink.php?story_fbid=555&id=777",
+            "https://m.facebook.com/permalink.php?id=777&story_fbid=555",
+            "https://www.facebook.com/reel/111?story=duplicate",
+        ]
+        cdp = FakeCDP([
+            {"result": {}},
+            {"result": {}},
+            {"result": {}},
+            {"result": {"value": json.dumps([{"url": u} for u in raw_links])}},
+        ])
+        expected_urls = [
+            "https://www.facebook.com/reel/111",
+            "https://www.facebook.com/videos/222",
+            "https://www.facebook.com/watch?v=333",
+            "https://www.facebook.com/posts/444",
+            "https://www.facebook.com/permalink.php?story_fbid=555&id=777",
+        ]
+
+        with patch.object(fb_keyword_nightly, "navigate_with_safety", return_value=True), \
+            patch.object(fb_keyword_nightly.time, "sleep", lambda *_: None):
+            discovered, errors = fb_keyword_nightly.discover_reels_from_source_page(
+                cdp,
+                "https://www.facebook.com/user1",
+                safety_state=fb_keyword_nightly.new_fb_safety_state(
+                    max_runtime_seconds=60,
+                    max_navigations=10,
+                ),
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual([item["url"] for item in discovered], expected_urls)
+        for discovered_url in expected_urls:
+            self.assertTrue(fb_keyword_nightly.is_direct_reel_video_target(discovered_url))
+
+    def test_canonicalize_reel_video_post_permalink_urls(self):
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://www.facebook.com/reel/111?x=1"),
+            "https://www.facebook.com/reel/111",
+        )
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://www.facebook.com/videos/222?x=1"),
+            "https://www.facebook.com/videos/222",
+        )
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://www.facebook.com/watch/?v=333&foo=bar"),
+            "https://www.facebook.com/watch?v=333",
+        )
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://www.facebook.com/permalink.php?foo=bar&story_fbid=444&id=666"),
+            "https://www.facebook.com/permalink.php?story_fbid=444&id=666",
+        )
+        self.assertEqual(
+            fb_keyword_nightly.canonicalize_source_url("https://www.facebook.com/user/posts/555?foo=1&bar=2"),
+            "https://www.facebook.com/posts/555",
+        )
+
+
+class TestCreatorFirstScheduling(unittest.TestCase):
+    """Planner tests for source-first scheduling and backfill/revisit ordering."""
+
+    def setUp(self):
+        self.now = datetime(2026, 7, 22, 12, 0, 0)
+        self.source_record = {
+            "url": "https://www.facebook.com/drew.canole/reels/",
+            "platform": "facebook",
+            "crawl_mode": "source",
+            "label": "Drew Canole",
+            "status": "active",
+        }
+        self.source_key = fb_keyword_nightly.stable_source_key(self.source_record["url"])
+
+    def test_scrape_budget_default_cap_remains_three(self):
+        self.assertEqual(fb_keyword_nightly.DEFAULT_MAX_SCRAPE, 3)
+
+    def test_bounded_backfill_new_revisit_scheduling(self):
+        discovered = [
+            "https://www.facebook.com/reel/900",
+            "https://www.facebook.com/watch/?v=901",
+        ]
+        new_keys = {fb_keyword_nightly.stable_source_key(url) for url in discovered}
+        source_state = {
+            "version": 1,
+            "updated_at": "2026-07-20T00:00:00",
+            "sources": {
+                self.source_key: {
+                    "source_key": self.source_key,
+                    "source_url": self.source_record["url"],
+                    "posts": {
+                        "post:101": {
+                            "url": "https://www.facebook.com/user/posts/101",
+                            "first_seen": "2026-06-01T00:00:00",
+                            "last_seen": "2026-06-10T00:00:00",
+                            "last_scraped_at": "",
+                            "scrape_count": 0,
+                            "status": "stale",
+                            "current": False,
+                        },
+                        "post:102": {
+                            "url": "https://www.facebook.com/user/posts/102",
+                            "first_seen": "2026-07-10T00:00:00",
+                            "last_seen": "2026-07-10T00:00:00",
+                            "last_scraped_at": "2026-07-10T00:00:00",
+                            "scrape_count": 1,
+                            "status": "current",
+                            "current": True,
+                            "next_revisit_at": "2026-07-21T00:00:00",
+                        },
+                        "post:103": {
+                            "url": "https://www.facebook.com/user/posts/103",
+                            "first_seen": (self.now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S"),
+                            "last_seen": (self.now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S"),
+                            "last_scraped_at": self.now.isoformat(),
+                            "scrape_count": 2,
+                            "status": "current",
+                            "current": True,
+                            "next_revisit_at": "2026-07-25T00:00:00",
+                        },
+                    },
+                }
+            },
+        }
+
+        tasks, summary = fb_keyword_nightly.plan_source_scrape_tasks(
+            explicit_urls=[],
+            source_records=[self.source_record],
+            source_state=source_state,
+            discovered_by_source={self.source_key: discovered},
+            new_post_keys_by_source={self.source_key: new_keys},
+            max_scrape=3,
+            now=self.now,
+        )
+
+        self.assertEqual([task["reason"] for task in tasks], ["latest", "latest", "backfill"])
+        self.assertEqual(summary["selected_count"], 3)
+        self.assertEqual(summary["selected_by_reason"]["latest"], 2)
+        self.assertEqual(summary["selected_by_reason"]["backfill"], 1)
+        self.assertEqual(summary["selected_by_reason"]["revisit"], 0)
+        self.assertEqual(summary["new_count"], 2)
+        self.assertTrue(summary["discovered_count"] >= 2)
+        self.assertIn(fb_keyword_nightly.stable_source_key(discovered[0]), source_state["sources"][self.source_key]["posts"])
+        self.assertIn(fb_keyword_nightly.stable_source_key(discovered[1]), source_state["sources"][self.source_key]["posts"])
+        self.assertEqual(len(tasks), 3)
+
+    def test_plan_allows_revisit_before_budget_exhaustion(self):
+        discovered = [
+            "https://www.facebook.com/reel/900",
+            "https://www.facebook.com/watch/?v=901",
+            "https://www.facebook.com/videos/902",
+        ]
+        new_keys = {fb_keyword_nightly.stable_source_key(url) for url in discovered}
+        source_state = {
+            "version": 1,
+            "updated_at": "2026-07-20T00:00:00",
+            "sources": {
+                self.source_key: {
+                    "source_key": self.source_key,
+                    "source_url": self.source_record["url"],
+                    "posts": {
+                        "post:101": {
+                            "url": "https://www.facebook.com/user/posts/101",
+                            "first_seen": "2026-06-01T00:00:00",
+                            "last_seen": "2026-06-10T00:00:00",
+                            "last_scraped_at": "",
+                            "scrape_count": 0,
+                            "status": "stale",
+                            "current": False,
+                        },
+                        "post:102": {
+                            "url": "https://www.facebook.com/user/posts/102",
+                            "first_seen": "2026-07-10T00:00:00",
+                            "last_seen": "2026-07-10T00:00:00",
+                            "last_scraped_at": "2026-07-10T00:00:00",
+                            "scrape_count": 1,
+                            "status": "current",
+                            "current": True,
+                            "next_revisit_at": "2026-07-21T00:00:00",
+                        },
+                    },
+                }
+            },
+        }
+        tasks, summary = fb_keyword_nightly.plan_source_scrape_tasks(
+            explicit_urls=[],
+            source_records=[self.source_record],
+            source_state=source_state,
+            discovered_by_source={self.source_key: discovered},
+            new_post_keys_by_source={self.source_key: new_keys},
+            max_scrape=4,
+            now=self.now,
+        )
+
+        self.assertEqual([task["reason"] for task in tasks], ["latest", "latest", "latest", "backfill"])
+        self.assertEqual(summary["selected_by_reason"]["revisit"], 0)
+
+    def test_creator_first_mode_ignores_legacy_query_config(self):
+        with tempfile.TemporaryDirectory():
+            legacy_queries = [{"query": "toe nail fungal infection natural remedies", "enabled": True}]
+            with patch.object(fb_keyword_nightly, "load_targets_file", return_value=[self.source_record]), \
+                patch.object(fb_keyword_nightly, "load_keyword_queries", return_value=legacy_queries), \
+                patch.object(fb_keyword_nightly, "discover_source_reels", return_value=({}, [])), \
+                patch.object(
+                    fb_keyword_nightly,
+                    "plan_source_scrape_tasks",
+                    return_value=([], {
+                        "discovered_count": 0,
+                        "new_count": 0,
+                        "revisited_count": 0,
+                        "skipped_current": 0,
+                        "selected_count": 0,
+                        "explicit_count": 0,
+                        "source_count": 1,
+                        "selected_by_reason": {"explicit": 0, "latest": 0, "backfill": 0, "revisit": 0},
+                    }),
+                ), \
+                patch.object(fb_keyword_nightly, "load_source_crawl_state", return_value={"version": 1, "updated_at": "", "sources": {}}), \
+                patch.object(fb_keyword_nightly, "save_source_crawl_state"), \
+                patch.object(fb_keyword_nightly, "save_latest"), \
+                patch.object(fb_keyword_nightly, "attach_safety_summary", lambda summary, _: summary), \
+                patch.object(fb_keyword_nightly.time, "sleep", lambda *_: None), \
+                patch.object(fb_keyword_nightly, "run_keyword_search") as run_keyword_search, \
+                patch.object(sys, "argv", ["prog", "--dry-run"]):
+                self.assertEqual(fb_keyword_nightly.main(), 0)
+
+        run_keyword_search.assert_not_called()
+
+    def test_source_state_dedupe_across_permalink_php_and_posts_shapes(self):
+        discovered = ["https://www.facebook.com/permalink.php?story_fbid=303&id=777"]
+        source_state = {
+            "version": 1,
+            "updated_at": "2026-07-20T00:00:00",
+            "sources": {
+                self.source_key: {
+                    "source_key": self.source_key,
+                    "source_url": self.source_record["url"],
+                    "posts": {
+                        "post:303": {
+                            "url": "https://www.facebook.com/user/posts/303",
+                            "first_seen": "2026-06-01T00:00:00",
+                            "last_seen": "2026-07-21T00:00:00",
+                            "last_scraped_at": "2026-07-21T00:00:00",
+                            "scrape_count": 2,
+                            "status": "current",
+                            "current": True,
+                            "next_revisit_at": "2026-07-24T00:00:00",
+                        },
+                    },
+                }
+            },
+        }
+        tasks, summary = fb_keyword_nightly.plan_source_scrape_tasks(
+            explicit_urls=[],
+            source_records=[self.source_record],
+            source_state=source_state,
+            discovered_by_source={self.source_key: discovered},
+            new_post_keys_by_source={self.source_key: set()},
+            max_scrape=3,
+            now=self.now,
+        )
+
+        self.assertEqual(tasks, [])
+        self.assertIn("post:303", source_state["sources"][self.source_key]["posts"])
+        self.assertNotIn("permalink:777:303", source_state["sources"][self.source_key]["posts"])
+        self.assertEqual(summary["discovered_count"], 0)
+        self.assertEqual(summary["selected_count"], 0)
+        self.assertEqual(summary["skipped_current"], 1)
 
 
 class TestSafetyReporting(unittest.TestCase):
@@ -1645,6 +2052,485 @@ class TestReelCronWrapper(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(run.call_args.args[0], [self.REPO_PYTHON, str(fb_reel_night_cron.SCRIPT), "--max-candidates", "10", "--max-scrape", "3"])
         ingest.assert_called_once_with(str(latest_dir), self.REPO_PYTHON)
+
+
+class TestCreatorFirstDiscovery(unittest.TestCase):
+    def test_stable_source_key_for_configured_sources(self):
+        self.assertEqual(
+            fb_keyword_nightly.stable_source_key("https://www.facebook.com/creator/reels/"),
+            "url:https://www.facebook.com/creator/reels",
+        )
+        self.assertEqual(
+            fb_keyword_nightly.stable_source_key(
+                "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+            ),
+            "url:https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab",
+        )
+
+    def test_source_surface_expansion_for_vanity_reels(self):
+        self.assertEqual(
+            fb_keyword_nightly.discover_source_surface_urls("https://www.facebook.com/creator/reels"),
+            [
+                "https://www.facebook.com/creator",
+                "https://www.facebook.com/creator/reels",
+                "https://www.facebook.com/creator/videos",
+            ],
+        )
+
+    def test_source_surface_expansion_for_profile_php_reels_tab(self):
+        self.assertEqual(
+            fb_keyword_nightly.discover_source_surface_urls(
+                "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+            ),
+            [
+                "https://www.facebook.com/profile.php?id=100047211517264",
+                "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab",
+                "https://www.facebook.com/profile.php?id=100047211517264&sk=videos",
+            ],
+        )
+
+    def test_canonical_content_shapes_and_cross_shape_dedupe(self):
+        canonical = fb_keyword_nightly.canonicalize_source_url
+        key = fb_keyword_nightly.stable_source_key
+
+        self.assertEqual(canonical("/reel/101/?ref=feed"), "https://www.facebook.com/reel/101")
+        self.assertEqual(canonical("/watch/?v=202&ref=feed"), "https://www.facebook.com/watch?v=202")
+        self.assertEqual(canonical("/creator/videos/202/?ref=feed"), "https://www.facebook.com/videos/202")
+        self.assertEqual(canonical("/creator/posts/303/?ref=feed"), "https://www.facebook.com/posts/303")
+        self.assertEqual(canonical("/creator/permalink/303/?ref=feed"), "https://www.facebook.com/posts/303")
+        self.assertEqual(key("/creator/posts/303"), key("/creator/permalink/303"))
+        self.assertEqual(key("/creator/permalink.php?story_fbid=303&id=777"), key("/creator/posts/303"))
+
+    def test_source_page_discovers_mixed_content_and_deduplicates(self):
+        anchors = [
+            {"url": "/reel/101/?ref=feed"},
+            {"url": "/watch/?v=202&ref=feed"},
+            {"url": "/creator/videos/202/?ref=duplicate"},
+            {"url": "/creator/posts/303/?ref=feed"},
+            {"url": "/creator/permalink.php?story_fbid=303&id=777"},
+            {"url": "/creator/permalink/303/?ref=duplicate"},
+            {"url": "/creator/posts/not-numeric"},
+            {"url": "https://example.com/reel/999"},
+        ]
+        cdp = FakeCDP(runtime_evaluate_responses=[{}, {}, {}, {
+            "result": {"value": anchors},
+        }])
+        with patch.object(fb_keyword_nightly, "navigate_with_safety", return_value=True), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None):
+            items, errors = fb_keyword_nightly.discover_reels_from_source_page(
+                cdp, "https://www.facebook.com/creator"
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual([item["id"] for item in items], ["reel:101", "video:202", "post:303"])
+        self.assertEqual(
+            [item["url"] for item in items],
+            [
+                "https://www.facebook.com/reel/101",
+                "https://www.facebook.com/watch?v=202",
+                "https://www.facebook.com/posts/303",
+            ],
+        )
+
+    def test_discovery_errors_strip_query_values(self):
+        source_url = "https://www.facebook.com/creator?secret=token&tracking=abc"
+        safety_state = fb_keyword_nightly.new_fb_safety_state(max_runtime_seconds=60, max_navigations=10)
+        safety_state["stopped"] = True
+        safety_state["stop_reason"] = "manual stop"
+        cdp = FakeCDP([])
+        with patch.object(fb_keyword_nightly, "navigate_with_safety", return_value=False), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None):
+            items, errors = fb_keyword_nightly.discover_reels_from_source_page(
+                cdp, source_url, safety_state=safety_state
+            )
+
+        self.assertEqual(items, [])
+        self.assertEqual(errors, ["https://www.facebook.com/creator: safety stop (manual stop)"])
+        self.assertNotIn("secret", errors[0])
+        self.assertNotIn("tracking", errors[0])
+
+    def test_discover_source_reels_expands_cross_surface_and_dedupes(self):
+        source_records = [{"url": "https://www.facebook.com/creator/reels"}]
+        source_key = fb_keyword_nightly.stable_source_key(source_records[0]["url"])
+        safety_state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=60,
+            max_navigations=10,
+        )
+
+        def fake_discover_reels(_cdp, source_url, safety_state=None):
+            if source_url == "https://www.facebook.com/creator":
+                return ([], [])
+            if source_url == "https://www.facebook.com/creator/reels":
+                return (
+                    [
+                        {"url": "/creator/permalink.php?story_fbid=303&id=777"},
+                        {"url": "/reel/101"},
+                    ],
+                    [],
+                )
+            if source_url == "https://www.facebook.com/creator/videos":
+                return (
+                    [
+                        {"url": "/creator/permalink/303"},
+                        {"url": "/watch/?v=202"},
+                    ],
+                    [],
+                )
+            return ([], [])
+
+        with patch.object(fb_keyword_nightly, "discover_reels_from_source_page", side_effect=fake_discover_reels), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None), \
+            patch.object(fb_keyword_nightly, "ensure_browser", return_value=True), \
+            patch.object(fb_keyword_nightly, "create_new_tab", return_value=("ws://source-surface", "", "")), \
+            patch.object(fb_keyword_nightly, "CDP", return_value=FakeCDP()):
+            discovered_by_source, errors = fb_keyword_nightly.discover_source_reels(
+                source_records=source_records,
+                max_per_source=3,
+                max_total=None,
+                safety_state=safety_state,
+            )
+
+        self.assertEqual(errors, [])
+        discovered = discovered_by_source.get(source_key, [])
+        self.assertEqual(
+            discovered,
+            [
+                "https://www.facebook.com/permalink.php?story_fbid=303&id=777",
+                "https://www.facebook.com/reel/101",
+                "https://www.facebook.com/watch?v=202",
+            ],
+        )
+
+    def test_discover_source_reels_rounds_across_surfaces_before_surface_cap(self):
+        source_records = [{"url": "https://www.facebook.com/creator/reels"}]
+        source_key = fb_keyword_nightly.stable_source_key(source_records[0]["url"])
+        safety_state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=60,
+            max_navigations=10,
+        )
+        seen_urls: list[str] = []
+
+        def fake_discover_reels(_cdp, source_url, safety_state=None):
+            seen_urls.append(source_url)
+            if source_url == "https://www.facebook.com/creator":
+                return (
+                    [
+                        {"url": "/creator/reel/101"},
+                        {"url": "/creator/reel/102"},
+                        {"url": "/creator/reel/103"},
+                        {"url": "/creator/reel/104"},
+                        {"url": "/creator/reel/105"},
+                        {"url": "/creator/reel/106"},
+                    ],
+                    [],
+                )
+            if source_url == "https://www.facebook.com/creator/reels":
+                return (
+                    [
+                        {"url": "/creator/reel/201"},
+                        {"url": "/watch/?v=777"},
+                    ],
+                    [],
+                )
+            return (
+                [
+                    {"url": "/creator/posts/901"},
+                    {"url": "/creator/reel/301"},
+                ],
+                [],
+            )
+
+        with patch.object(fb_keyword_nightly, "discover_reels_from_source_page", side_effect=fake_discover_reels), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None), \
+            patch.object(fb_keyword_nightly, "ensure_browser", return_value=True), \
+            patch.object(fb_keyword_nightly, "create_new_tab", return_value=("ws://source-surface", "", "")), \
+            patch.object(fb_keyword_nightly, "CDP", return_value=FakeCDP()):
+            discovered_by_source, errors = fb_keyword_nightly.discover_source_reels(
+                source_records=source_records,
+                max_per_source=5,
+                max_total=None,
+                safety_state=safety_state,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://www.facebook.com/creator",
+                "https://www.facebook.com/creator/reels",
+                "https://www.facebook.com/creator/videos",
+            ],
+        )
+        discovered = discovered_by_source.get(source_key, [])
+        self.assertEqual(
+            discovered,
+            [
+                "https://www.facebook.com/reel/101",
+                "https://www.facebook.com/reel/201",
+                "https://www.facebook.com/posts/901",
+                "https://www.facebook.com/reel/102",
+                "https://www.facebook.com/watch?v=777",
+            ],
+        )
+
+    def test_discover_source_reels_dedupes_duplicate_posts_reels_and_videos_across_surfaces(self):
+        source_records = [{"url": "https://www.facebook.com/creator/reels"}]
+        source_key = fb_keyword_nightly.stable_source_key(source_records[0]["url"])
+        safety_state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=60,
+            max_navigations=10,
+        )
+
+        def fake_discover_reels(_cdp, source_url, safety_state=None):
+            if source_url == "https://www.facebook.com/creator":
+                return (
+                    [
+                        {"url": "/creator/reel/111"},
+                        {"url": "/creator/reel/111?foo=bar"},
+                        {"url": "/creator/permalink/555?id=123"},
+                        {"url": "/watch/?v=333"},
+                    ],
+                    [],
+                )
+            if source_url == "https://www.facebook.com/creator/reels":
+                return (
+                    [
+                        {"url": "/reel/111"},
+                        {"url": "/watch/?v=333"},
+                        {"url": "/creator/permalink.php?story_fbid=555&id=777"},
+                    ],
+                    [],
+                )
+            return (
+                [
+                    {"url": "/creator/posts/555"},
+                    {"url": "/reel/444"},
+                ],
+                [],
+            )
+
+        with patch.object(fb_keyword_nightly, "discover_reels_from_source_page", side_effect=fake_discover_reels), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None), \
+            patch.object(fb_keyword_nightly, "ensure_browser", return_value=True), \
+            patch.object(fb_keyword_nightly, "create_new_tab", return_value=("ws://source-surface", "", "")), \
+            patch.object(fb_keyword_nightly, "CDP", return_value=FakeCDP()):
+            discovered_by_source, errors = fb_keyword_nightly.discover_source_reels(
+                source_records=source_records,
+                max_per_source=5,
+                max_total=None,
+                safety_state=safety_state,
+            )
+
+        self.assertEqual(errors, [])
+        discovered = discovered_by_source.get(source_key, [])
+        self.assertEqual(
+            discovered,
+            [
+                "https://www.facebook.com/reel/111",
+                "https://www.facebook.com/posts/555",
+                "https://www.facebook.com/watch?v=333",
+                "https://www.facebook.com/reel/444",
+            ],
+        )
+
+    def test_discover_source_reels_stops_immediately_on_safety_signal(self):
+        source_records = [
+            {"url": "https://www.facebook.com/creator/reels"},
+            {"url": "https://www.facebook.com/second"},
+        ]
+        safety_state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=60,
+            max_navigations=10,
+        )
+        called = []
+
+        def fake_discover_reels(_cdp, source_url, safety_state=None):
+            called.append(source_url)
+            safety_state["stopped"] = True
+            safety_state["stop_reason"] = "manual stop"
+            return ([], [])
+
+        with patch.object(fb_keyword_nightly, "discover_reels_from_source_page", side_effect=fake_discover_reels), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None), \
+            patch.object(fb_keyword_nightly, "ensure_browser", return_value=True), \
+            patch.object(fb_keyword_nightly, "create_new_tab", return_value=("ws://source-stop", "", "")), \
+            patch.object(fb_keyword_nightly, "CDP", return_value=FakeCDP()):
+            discovered_by_source, errors = fb_keyword_nightly.discover_source_reels(
+                source_records=source_records,
+                max_per_source=2,
+                max_total=None,
+                safety_state=safety_state,
+            )
+
+        self.assertEqual(discovered_by_source, {})
+        self.assertEqual(errors, [])
+        self.assertEqual(len(called), 1)
+
+    def test_discover_source_reels_respects_per_source_and_total_limits(self):
+        source_records = [
+            {"url": "https://www.facebook.com/creator/reels"},
+            {"url": "https://www.facebook.com/other/videos"},
+        ]
+        safety_state = fb_keyword_nightly.new_fb_safety_state(
+            max_runtime_seconds=60,
+            max_navigations=10,
+        )
+
+        def fake_discover_reels(_cdp, source_url, safety_state=None):
+            if "creator" in source_url:
+                return (
+                    [
+                        {"url": "https://www.facebook.com/reel/111"},
+                        {"url": "https://www.facebook.com/reel/222"},
+                        {"url": "https://www.facebook.com/reel/333"},
+                    ],
+                    [],
+                )
+            return (
+                [
+                    {"url": "https://www.facebook.com/reel/444"},
+                    {"url": "https://www.facebook.com/reel/555"},
+                ],
+                [],
+            )
+
+        with patch.object(fb_keyword_nightly, "discover_reels_from_source_page", side_effect=fake_discover_reels), \
+            patch.object(fb_keyword_nightly.time, "sleep", return_value=None), \
+            patch.object(fb_keyword_nightly, "ensure_browser", return_value=True), \
+            patch.object(fb_keyword_nightly, "create_new_tab", return_value=("ws://source-limits", "", "")), \
+            patch.object(fb_keyword_nightly, "CDP", return_value=FakeCDP()):
+            discovered_by_source, errors = fb_keyword_nightly.discover_source_reels(
+                source_records=source_records,
+                max_per_source=2,
+                max_total=3,
+                safety_state=safety_state,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            discovered_by_source[fb_keyword_nightly.stable_source_key("https://www.facebook.com/creator/reels")],
+            [
+                "https://www.facebook.com/reel/111",
+                "https://www.facebook.com/reel/222",
+            ],
+        )
+        self.assertEqual(
+            discovered_by_source[fb_keyword_nightly.stable_source_key("https://www.facebook.com/other/videos")],
+            ["https://www.facebook.com/reel/444"],
+        )
+
+    def test_active_sources_are_exclusive_driver_despite_legacy_query(self):
+        legacy_queries = [{"query": fb_keyword_nightly.DEFAULT_QUERY, "enabled": True}]
+        sources = [{"url": "https://www.facebook.com/creator", "status": "active"}]
+
+        self.assertEqual(fb_keyword_nightly.select_discovery_driver(sources), "source")
+        self.assertEqual(
+            fb_keyword_nightly.resolve_runtime_query(fb_keyword_nightly.DEFAULT_QUERY, legacy_queries),
+            fb_keyword_nightly.DEFAULT_QUERY,
+        )
+        self.assertEqual(fb_keyword_nightly.select_discovery_driver([]), "keyword")
+
+    def test_new_release_planning_is_bounded_by_safety_cap_three(self):
+        source_url = "https://www.facebook.com/creator"
+        source_key = fb_keyword_nightly.stable_source_key(source_url)
+        urls = [f"https://www.facebook.com/reel/{item_id}" for item_id in (401, 402, 403, 404)]
+        tasks, summary = fb_keyword_nightly.plan_source_scrape_tasks(
+            explicit_urls=[],
+            source_records=[{"url": source_url, "status": "active"}],
+            source_state={"sources": {}},
+            discovered_by_source={source_key: urls},
+            new_post_keys_by_source={source_key: {fb_keyword_nightly.stable_source_key(url) for url in urls}},
+            max_scrape=fb_keyword_nightly.DEFAULT_MAX_SCRAPE,
+            now=datetime(2026, 7, 22, 1, 0, 0),
+        )
+
+        self.assertEqual(fb_keyword_nightly.DEFAULT_MAX_SCRAPE, 3)
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual([task["reason"] for task in tasks], ["latest", "latest", "latest"])
+        self.assertEqual(summary["selected_count"], 3)
+
+    def test_source_mode_prints_source_crawl_driver(self):
+        with tempfile.TemporaryDirectory():
+            with patch.object(fb_keyword_nightly, "load_targets_file", return_value=[
+                {"url": "https://www.facebook.com/drew.canole/reels", "platform": "facebook", "crawl_mode": "source", "status": "active"}
+            ]), \
+                patch.object(fb_keyword_nightly, "discover_source_reels", return_value=({}, [])), \
+                patch.object(fb_keyword_nightly, "plan_source_scrape_tasks", return_value=([], {
+                    "discovered_count": 0,
+                    "new_count": 0,
+                    "revisited_count": 0,
+                    "skipped_current": 0,
+                    "selected_count": 0,
+                    "explicit_count": 0,
+                    "source_count": 1,
+                    "selected_by_reason": {"explicit": 0, "latest": 0, "backfill": 0, "revisit": 0},
+                })), \
+                patch.object(fb_keyword_nightly, "load_source_crawl_state", return_value={"version": 1, "updated_at": "", "sources": {}}), \
+                patch.object(fb_keyword_nightly, "save_source_crawl_state"), \
+                patch.object(fb_keyword_nightly, "save_latest"), \
+                patch.object(fb_keyword_nightly, "attach_safety_summary", lambda summary, _: summary), \
+                patch.object(fb_keyword_nightly.time, "sleep", lambda *_: None), \
+                patch.object(sys, "argv", ["prog", "--dry-run"]):
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(fb_keyword_nightly.main(), 0)
+
+        self.assertIn("Driver: source-crawl", output.getvalue())
+
+    def test_main_source_mode_uses_stable_source_keys_without_source_prefix(self):
+        drew_url = "https://www.facebook.com/drew.canole/reels/"
+        profile_url = "https://www.facebook.com/profile.php?id=100047211517264&sk=reels_tab"
+        drew_key = fb_keyword_nightly.stable_source_key(drew_url)
+        profile_key = fb_keyword_nightly.stable_source_key(profile_url)
+
+        discovered_by_source = {
+            drew_key: ["https://www.facebook.com/reel/900"],
+            profile_key: ["https://www.facebook.com/reel/901"],
+        }
+
+        def fake_discover_source_reels(source_records, max_per_source, max_total, safety_state):
+            source_keys = [str(record.get("source_key", "")) for record in source_records]
+            self.assertEqual(source_keys, [drew_key, profile_key])
+            self.assertFalse(any(key.startswith("source:") for key in source_keys))
+            return discovered_by_source, []
+
+        def assert_planner_args(*_args, **kwargs):
+            source_records = kwargs.get("source_records", [])
+            source_state = kwargs.get("source_state", {})
+            discovered_by_source = kwargs.get("discovered_by_source", {})
+            new_post_keys_by_source = kwargs.get("new_post_keys_by_source", {})
+            planner_source_keys = [str(record.get("source_key", "")) for record in source_records]
+            self.assertEqual(planner_source_keys, [drew_key, profile_key])
+            self.assertFalse(any(key.startswith("source:") for key in planner_source_keys))
+            self.assertEqual(set(discovered_by_source.keys()), {drew_key, profile_key})
+            self.assertEqual(set(new_post_keys_by_source.keys()), {drew_key, profile_key})
+            self.assertFalse(any(key.startswith("source:") for key in discovered_by_source))
+            self.assertFalse(any(key.startswith("source:") for key in new_post_keys_by_source))
+            self.assertEqual(source_state.get("sources", {}), {})
+            return ([], {
+                "discovered_count": 0,
+                "new_count": 0,
+                "revisited_count": 0,
+                "skipped_current": 0,
+                "selected_count": 0,
+                "explicit_count": 0,
+                "source_count": 2,
+                "selected_by_reason": {"explicit": 0, "latest": 0, "backfill": 0, "revisit": 0},
+            })
+
+        with tempfile.TemporaryDirectory():
+            with patch.object(fb_keyword_nightly, "load_targets_file", return_value=[
+                {"url": drew_url, "platform": "facebook", "crawl_mode": "source", "status": "active"},
+                {"url": profile_url, "platform": "facebook", "crawl_mode": "source", "status": "active"},
+            ]), \
+                patch.object(fb_keyword_nightly, "discover_source_reels", side_effect=fake_discover_source_reels), \
+                patch.object(fb_keyword_nightly, "load_source_crawl_state", return_value={"version": 1, "updated_at": "", "sources": {}}), \
+                patch.object(fb_keyword_nightly, "save_source_crawl_state"), \
+                patch.object(fb_keyword_nightly, "save_latest"), \
+                patch.object(fb_keyword_nightly, "attach_safety_summary", lambda summary, _: summary), \
+                patch.object(sys, "argv", ["prog", "--dry-run"]), \
+                patch.object(fb_keyword_nightly, "plan_source_scrape_tasks", side_effect=assert_planner_args):
+
+                self.assertEqual(fb_keyword_nightly.main(), 0)
 
 
 if __name__ == "__main__":

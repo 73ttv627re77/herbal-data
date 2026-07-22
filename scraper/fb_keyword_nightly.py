@@ -299,6 +299,19 @@ def _is_approved_facebook_host(host: Optional[str]) -> bool:
     return str(host).strip().lower().rstrip(".") in FACEBOOK_ALLOWED_HOSTS
 
 
+def _error_context_url(url: str) -> str:
+    """Return a stable error label for a Facebook URL without query string values."""
+    normalized = canonicalize_source_url(url)
+    if normalized:
+        parsed = urllib.parse.urlsplit(normalized)
+        if parsed.scheme and parsed.netloc:
+            return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+    parsed = urllib.parse.urlsplit((url or "").strip())
+    if parsed.scheme and parsed.netloc:
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+    return str(url)
+
+
 def parse_facebook_safety_reason(page_state: dict) -> Optional[str]:
     """Return a safety-stop reason if page markers indicate a warning/fail state."""
     if not isinstance(page_state, dict):
@@ -477,19 +490,56 @@ def _is_profile_reels_tab_redirect(target_url: str, current_url: str) -> bool:
         return False
 
     target_query = urllib.parse.parse_qs(target.query)
-    if target_query.get("sk", [None])[0] != "reels_tab":
-        return False
-    if not target_query.get("id", [None])[0]:
+    target_query_id_values = target_query.get("id", [])
+    if len(target_query_id_values) != 1 or not target_query_id_values[0]:
         return False
 
+    target_query_surface = target_query.get("sk", [None])[0]
     current_path = (current.path or "/").rstrip("/") or "/"
-    if current.query:
+    current_query = urllib.parse.parse_qs(current.query)
+
+    if target_query_surface is None:
+        expected_depth = 1
+        expected_suffix = None
+        if set(target_query.keys()) != {"id"}:
+            return False
+        if current_query:
+            return False
+    elif target_query_surface == "reels_tab":
+        expected_depth = 2
+        expected_suffix = "reels"
+        if set(target_query.keys()) != {"id", "sk"}:
+            return False
+        if current_query:
+            return False
+    elif target_query_surface == "videos":
+        expected_depth = 2
+        expected_suffix = "videos"
+        if set(target_query.keys()) != {"id", "sk"}:
+            return False
+        if set(current_query.keys()) != {"id", "sk"}:
+            return False
+    else:
         return False
+
+    for _, values in target_query.items():
+        if len(values) != 1 or not values[0]:
+            return False
+    for key, current_values in current_query.items():
+        if key not in target_query:
+            return False
+        target_values = target_query[key]
+        if len(current_values) != 1 or current_values[0] != target_values[0]:
+            return False
+
+    if expected_suffix is None:
+        parts = [part for part in current_path.split("/") if part]
+        return len(parts) == 1
 
     parts = [part for part in current_path.split("/") if part]
     if len(parts) != 2:
         return False
-    if parts[1] != "reels":
+    if parts[1] != expected_suffix:
         return False
 
     return True
@@ -1004,15 +1054,46 @@ def canonicalize_source_url(url: str) -> str:
     netloc = parsed.hostname.lower()
     path = (parsed.path or "/").rstrip("/")
     query = parsed.query or ""
+    parsed_query = urllib.parse.parse_qs(parsed.query)
 
-    if path.startswith("/watch"):
+    if path == "/profile.php":
+        profile_id = parsed_query.get("id", [None])[0]
+        if not profile_id:
+            query = ""
+        else:
+            query_values = [("id", profile_id)]
+            profile_sk = parsed_query.get("sk", [None])[0]
+            if profile_sk:
+                query_values.append(("sk", profile_sk))
+            query = urllib.parse.urlencode(query_values)
+
+    reel_video_id_match = re.search(r"/(?:reel|videos?)/([0-9]+)(?:/|$)", path)
+    post_id_match = re.search(r"/(?:posts|permalink)/([0-9]+)(?:/|$)", path)
+
+    if reel_video_id_match:
+        if "/video" in reel_video_id_match.group(0):
+            path = f"/videos/{reel_video_id_match.group(1)}"
+        else:
+            path = f"/reel/{reel_video_id_match.group(1)}"
+        query = ""
+    elif path.startswith("/watch"):
         q = urllib.parse.parse_qs(parsed.query)
         if "v" in q and q["v"]:
             query = urllib.parse.urlencode({"v": q["v"][0]})
         else:
             query = ""
-    elif path.startswith("/reel/") or "/videos/" in path or "/video/" in path:
+    elif post_id_match:
+        path = f"/posts/{post_id_match.group(1)}"
         query = ""
+    elif re.search(r"/permalink\.php(?:/|$)", path):
+        path = "/permalink.php"
+        q = urllib.parse.parse_qs(parsed.query)
+        params = []
+        if q.get("story_fbid") and q["story_fbid"]:
+            params.append(("story_fbid", q["story_fbid"][0]))
+        if q.get("id") and q["id"]:
+            params.append(("id", q["id"][0]))
+        query = urllib.parse.urlencode(params)
     elif path.startswith("/share/"):
         query = parsed.query
 
@@ -1030,16 +1111,84 @@ def stable_source_key(url: str) -> str:
     m = re.search(r"/reel/([0-9]+)", path)
     if m:
         return f"reel:{m.group(1)}"
-    m = re.search(r"/videos?/([0-9]+)", path)
+    m = re.search(r"/videos?/([0-9]+)(?:/|$)", path)
     if m:
         return f"video:{m.group(1)}"
+    m = re.search(r"/posts/([0-9]+)(?:/|$)", path)
+    if m:
+        return f"post:{m.group(1)}"
     if path.startswith("/watch"):
         q = urllib.parse.parse_qs(parsed.query)
         if "v" in q and q["v"]:
-            return f"watch:{q['v'][0]}"
+            return f"video:{q['v'][0]}"
+    if re.search(r"/permalink\.php(?:/|$)", path):
+        q = urllib.parse.parse_qs(parsed.query)
+        story_fbid = q.get("story_fbid", [""])[0]
+        if story_fbid.isdigit():
+            return f"post:{story_fbid}"
     if normalized.startswith("https://www.facebook.com/share/"):
         return f"share:{normalized}"
     return f"url:{normalized}"
+
+
+def discover_source_surface_urls(source_url: str) -> list[str]:
+    """Return deterministic candidate creator surfaces for source discovery."""
+    normalized = canonicalize_source_url(source_url)
+    if not normalized:
+        return []
+
+    parsed = urllib.parse.urlsplit(normalized)
+    path = (parsed.path or "/").rstrip("/")
+    query = urllib.parse.parse_qs(parsed.query)
+    seen: set[str] = set()
+    surfaces: list[str] = []
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc.lower()
+
+    def add_surface(candidate_path: str, candidate_query: Optional[list[tuple[str, str]]] = None) -> None:
+        candidate_query = candidate_query or []
+        normalized_query = urllib.parse.urlencode(candidate_query)
+        surface = urllib.parse.urlunsplit(
+            (scheme, host, candidate_path or "/", normalized_query, "")
+        )
+        parsed_surface = urllib.parse.urlsplit(surface)
+        if not _is_approved_facebook_host(parsed_surface.hostname):
+            return
+        if parsed_surface.path == "/profile.php":
+            canonical_surface = surface
+        else:
+            canonical_surface = canonicalize_source_url(surface)
+        surface = canonical_surface
+        if surface and surface not in seen:
+            seen.add(surface)
+            surfaces.append(surface)
+
+    if path == "/profile.php":
+        profile_id = query.get("id", [None])[0]
+        if not profile_id:
+            return []
+        base_query = [("id", profile_id)]
+        add_surface("/profile.php", base_query)
+        add_surface("/profile.php", base_query + [("sk", "reels_tab")])
+        add_surface("/profile.php", base_query + [("sk", "videos")])
+        return surfaces
+
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return []
+
+    if parts[-1] in {"reels", "videos"}:
+        if len(parts) == 1:
+            return []
+        creator_parts = parts[:-1]
+    else:
+        creator_parts = parts
+
+    creator_root = "/" + "/".join(creator_parts)
+    add_surface(creator_root)
+    add_surface(f"{creator_root}/reels")
+    add_surface(f"{creator_root}/videos")
+    return surfaces
 
 
 def is_direct_reel_video_target(url: str) -> bool:
@@ -1054,8 +1203,10 @@ def is_direct_reel_video_target(url: str) -> bool:
     query = urllib.parse.parse_qs(parsed.query)
     share_reel_token = path[len("/share/r/"):] if path.startswith("/share/r/") else ""
     return bool(
-        re.search(r"/(?:reel|video|videos?)/", path) or
+        re.search(r"/(?:reel|video|videos?)/[0-9]+(?:/|$)", path) or
         (path.startswith("/watch") and query.get("v") and query["v"][0]) or
+        re.search(r"/(?:posts|permalink)/[0-9]+(?:/|$)", path) or
+        re.search(r"/permalink\.php(?:/|$)", path) or
         (path.startswith("/share/r/") and bool(share_reel_token.strip("/")))
     )
 
@@ -1244,7 +1395,7 @@ def discover_source_reels(
             source_url = record.get("url", "")
             if not source_url:
                 continue
-            source_key = stable_source_key(source_url)
+            source_key = str(record.get("source_key", "")).strip() or stable_source_key(source_url)
             if not source_key:
                 continue
             if safety_state is not None and safety_state.get("stopped"):
@@ -1253,41 +1404,82 @@ def discover_source_reels(
             if max_total is not None and total_discovered >= max_total:
                 break
 
-            candidates, discover_errors = discover_reels_from_source_page(
-                cdp,
-                source_url,
-                safety_state=safety_state,
-            )
-            if discover_errors:
-                errors.extend(discover_errors)
-
-            if not isinstance(candidates, list) or not candidates:
-                if safety_state is not None and safety_state.get("stopped"):
-                    break
-                if idx + 1 < len(source_records):
-                    time.sleep(source_switch_pause_seconds())
+            source_surface_urls = discover_source_surface_urls(source_url)
+            if not source_surface_urls:
                 continue
 
-            seen_for_source: set[str] = set()
+            source_surface_candidates: list[list[str]] = []
+            stop_discovery = False
+            for source_surface_url in source_surface_urls:
+                if safety_state is not None and safety_state.get("stopped"):
+                    stop_discovery = True
+                    break
+
+                candidates, discover_errors = discover_reels_from_source_page(
+                    cdp,
+                    source_surface_url,
+                    safety_state=safety_state,
+                )
+                if discover_errors:
+                    errors.extend(discover_errors)
+
+                if safety_state is not None and safety_state.get("stopped"):
+                    stop_discovery = True
+                    break
+
+                if not isinstance(candidates, list) or not candidates:
+                    source_surface_candidates.append([])
+                    continue
+
+                surface_urls: list[str] = []
+                surface_seen: set[str] = set()
+                for candidate in candidates:
+                    url = canonicalize_source_url(str(candidate.get("url", "")))
+                    if not url:
+                        continue
+                    post_key = stable_source_key(url)
+                    if not post_key.startswith(("reel:", "video:", "post:")):
+                        continue
+                    if post_key in surface_seen:
+                        continue
+                    surface_urls.append(url)
+                    surface_seen.add(post_key)
+                    if len(surface_urls) >= max_per_source:
+                        break
+                source_surface_candidates.append(surface_urls)
+                if stop_discovery:
+                    break
+
             out_urls: list[str] = []
-            for candidate in candidates[: max_per_source + 10]:
-                url = canonicalize_source_url(str(candidate.get("url", "")))
-                if not url:
-                    continue
-                post_key = stable_source_key(url)
-                if post_key in seen_for_source:
-                    continue
-                out_urls.append(url)
-                seen_for_source.add(post_key)
-                total_discovered += 1
-                if len(out_urls) >= max_per_source:
-                    break
-                if max_total is not None and total_discovered >= max_total:
-                    break
+            out_seen: set[str] = set()
+            if source_surface_candidates:
+                while len(out_urls) < max_per_source:
+                    added_in_cycle = False
+                    for surface_urls in source_surface_candidates:
+                        if len(out_urls) >= max_per_source:
+                            break
+                        if not surface_urls:
+                            continue
+                        candidate_url = surface_urls.pop(0)
+                        post_key = stable_source_key(candidate_url)
+                        if not post_key or post_key in out_seen:
+                            continue
+                        out_urls.append(candidate_url)
+                        out_seen.add(post_key)
+                        total_discovered += 1
+                        added_in_cycle = True
+                        if max_total is not None and total_discovered >= max_total:
+                            stop_discovery = True
+                            break
+                    if stop_discovery or not added_in_cycle:
+                        break
+
             if out_urls:
                 discovered_by_source[source_key] = out_urls
 
-            if safety_state is not None and safety_state.get("stopped"):
+            if stop_discovery:
+                break
+            if max_total is not None and total_discovered >= max_total:
                 break
 
             if idx + 1 < len(source_records):
@@ -1318,7 +1510,7 @@ def plan_source_scrape_tasks(
         source_url = canonicalize_source_url(str(rec.get("url", "")))
         if not source_url:
             continue
-        source_key = stable_source_key(source_url)
+        source_key = str(rec.get("source_key", "")).strip() or stable_source_key(source_url)
         if not source_key:
             continue
         source = dict(rec)
@@ -1549,11 +1741,12 @@ def discover_reels_from_source_page(
     source_url: str,
     safety_state: Optional[dict] = None,
 ) -> tuple[list[dict], list[str]]:
-    """Discover `/reel/<id>` links from a source poster stream page."""
+    """Discover canonical reel, video, and post links from a creator page."""
     errors: list[str] = []
+    source_error_id = _error_context_url(source_url)
     try:
         if "http" not in source_url:
-            errors.append(f"{source_url}: invalid source url")
+            errors.append(f"{source_error_id}: invalid source url")
             return [], errors
 
         if safety_state is None:
@@ -1563,7 +1756,7 @@ def discover_reels_from_source_page(
             )
         if not navigate_with_safety(cdp, source_url, safety_state):
             reason = str((safety_state or {}).get("stop_reason", "facebook safety stop"))
-            errors.append(f"{source_url}: safety stop ({reason})")
+            errors.append(f"{source_error_id}: safety stop ({reason})")
             return [], errors
         time.sleep(4)
 
@@ -1574,20 +1767,24 @@ def discover_reels_from_source_page(
         js = """
         (function() {
             var anchors = document.querySelectorAll('a[href]');
-            var seen = new Set();
             var out = [];
             for (var i = 0; i < anchors.length; i++) {
                 var href = anchors[i].getAttribute('href');
                 if (!href) continue;
-                if (href.indexOf('/reel/') === -1) continue;
+                if (
+                    href.indexOf('/reel/') === -1 &&
+                    href.indexOf('/video/') === -1 &&
+                    href.indexOf('/videos/') === -1 &&
+                    href.indexOf('/watch') === -1 &&
+                    href.indexOf('/posts/') === -1 &&
+                    href.indexOf('/permalink/') === -1 &&
+                    href.indexOf('/permalink.php') === -1
+                ) {
+                    continue;
+                }
                 if (href.startsWith('//')) href = 'https:' + href;
                 if (href.startsWith('/')) href = 'https://www.facebook.com' + href;
-                var m = href.match(/\\/reel\\/(\\d+)/);
-                if (!m) continue;
-                var id = m[1];
-                if (seen.has(id)) continue;
-                seen.add(id);
-                out.push({id: id, url: href});
+                out.push({url: href});
                 if (out.length >= 25) break;
             }
             return out;
@@ -1601,16 +1798,67 @@ def discover_reels_from_source_page(
             items = []
         if not isinstance(items, list):
             items = []
-        return [
-            {
-                "id": item.get("id"),
-                "url": canonicalize_source_url(str(item.get("url", ""))),
-            }
-            for item in items
-            if isinstance(item, dict) and item.get("id") and item.get("url")
-        ], errors
+        out = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_url = str(item.get("url", ""))
+            if not raw_url:
+                continue
+            url = canonicalize_source_url(raw_url)
+            if not url:
+                continue
+            post_key = stable_source_key(url)
+            if not post_key.startswith(("reel:", "video:", "post:")) or post_key in seen:
+                continue
+            seen.add(post_key)
+            out.append({"id": post_key, "url": url})
+        return out, errors
     except Exception as exc:
-        return [], [f"{source_url}: {exc}"]
+        return [], [f"{source_error_id}: {exc}"]
+
+
+def load_keyword_queries(path: Path = STATE_QUERIES) -> list[dict[str, object]]:
+    """Load active keyword query records."""
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return []
+
+    items = payload.get("queries") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return []
+    records: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        query = str(item.get("query", "")).strip()
+        if not query:
+            continue
+        enabled = str(item.get("enabled", "")).strip().lower()
+        if enabled and enabled not in {"true", "1", "yes", "on"}:
+            continue
+        records.append({"query": query, "enabled": True})
+    return records
+
+
+def resolve_runtime_query(cli_query: str, query_records: list[dict[str, object]]) -> str:
+    """Resolve the search query only when source discovery is not active."""
+    if cli_query and cli_query != DEFAULT_QUERY:
+        return cli_query.strip()
+    for item in query_records:
+        query = str(item.get("query", "")).strip()
+        if query:
+            return query
+    return cli_query.strip() or DEFAULT_QUERY
+
+
+def select_discovery_driver(source_records: list[dict[str, str]]) -> str:
+    """Select the exclusive operational discovery driver for this run."""
+    return "source" if source_records else "keyword"
 
 
 def resolve_source_targets(
@@ -2310,14 +2558,18 @@ def main() -> int:
         target_records_dedupe.append(record)
 
     explicit_urls, source_records = split_target_records(target_records_dedupe)
+    active_queries = load_keyword_queries()
 
     source_records_by_key = {}
     for record in source_records:
-        source_key = stable_source_key(record.get("url", ""))
+        source_key = str(record.get("source_key", "")).strip() or stable_source_key(record.get("url", ""))
         if not source_key or source_key in source_records_by_key:
             continue
+        record = dict(record)
+        record["source_key"] = source_key
         source_records_by_key[source_key] = record
     source_records = list(source_records_by_key.values())
+    discovery_driver = select_discovery_driver(source_records)
 
     source_state = load_source_crawl_state()
     discovery_errors: list[str] = []
@@ -2328,7 +2580,7 @@ def main() -> int:
         max_navigations=max(args.max_navigations, 1),
     )
 
-    if source_records:
+    if discovery_driver == "source":
         discovered_by_source, discovery_errors = discover_source_reels(
             source_records=source_records,
             max_per_source=args.max_discover_per_source,
@@ -2368,8 +2620,14 @@ def main() -> int:
         else:
             print("[planner] No source-crawl tasks were scheduled (all monitored sources are current and no revisit is due)")
 
+    operational_query = "source-crawl" if discovery_driver == "source" else (
+        resolve_runtime_query(args.query, active_queries)
+    )
     print(f"=== FB Keyword Nightly ===")
-    print(f"Query:    {args.query}")
+    if discovery_driver == "source":
+        print(f"Driver: source-crawl")
+    else:
+        print(f"Query:    {operational_query}")
     print(f"Targets:  {len(explicit_urls) + len(source_records)}")
     print(f"Planned:  {len(scheduled_tasks)}")
     print(f"Output:   {out_dir}")
@@ -2476,8 +2734,9 @@ def main() -> int:
         save_source_crawl_state(source_state)
 
     else:
+        query = resolve_runtime_query(args.query, active_queries)
         summary = run_keyword_search(
-            query=args.query,
+            query=query,
             max_candidates=args.max_candidates,
             max_scrape=args.max_scrape,
             dry_run=args.dry_run,
